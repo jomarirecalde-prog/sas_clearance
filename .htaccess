@@ -1,0 +1,9 @@
+RewriteEngine On
+
+# Keep direct files/folders at project root accessible.
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# Route all app requests through the root bootstrap.
+RewriteRule ^ index.php [L,QSA]
