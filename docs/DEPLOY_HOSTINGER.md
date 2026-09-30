@@ -52,7 +52,7 @@ $env:DB_PASSWORD = "your-mysql-password"
 python tools/deploy_hostinger.py
 ```
 
-Add `--import-db` only for a fresh database (runs `schema.sql` and `seed.sql`).
+Add `--import-db` only for a fresh database (runs `schema.sql` and `seed.sql`). Use `--legacy-upload` if remote `unzip` fails.
 
 SSH defaults: host `109.106.254.155`, port `65002`, user `u899628465` (override with `DEPLOY_SSH_*`). Deploy targets `clearancesas.online` unless `DEPLOY_SITE_DOMAIN` or `DEPLOY_REMOTE_DIR` is set.
 

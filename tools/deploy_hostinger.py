@@ -21,6 +21,7 @@ import os
 import posixpath
 import stat
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -37,9 +38,11 @@ DEFAULT_APP_BASE_URL = f"https://{DEFAULT_SITE_DOMAIN}"
 DEFAULT_DB_NAME = "u899628465_wpu_clearance"
 DEFAULT_DB_USER = "u899628465_wpu_clearance"
 
-SKIP_DIRS = {".git", "__pycache__", "node_modules"}
+SKIP_DIRS = {".git", "__pycache__", "node_modules", "tools"}
 SKIP_FILES = {".env", "Thumbs.db", ".DS_Store"}
 SKIP_SUFFIXES = {".sess", ".log"}
+REMOTE_ZIP_NAME = ".clearance-deploy-upload.zip"
+VENDOR_SKIP_DIR_NAMES = frozenset({"tests", "test", "benchmark"})
 
 
 def env(name: str, default: str = "") -> str:
@@ -114,6 +117,12 @@ def should_skip(rel: Path) -> bool:
         return True
     if rel.suffix.lower() in SKIP_SUFFIXES:
         return True
+    if rel.suffix.lower() == ".zip" and rel.name.endswith("-hostinger-deploy.zip"):
+        return True
+    if len(parts) >= 2 and parts[0] == "storage" and parts[1] == "requirement-attachments":
+        return True
+    if parts and parts[0] == "vendor" and VENDOR_SKIP_DIR_NAMES.intersection(parts):
+        return True
     if "storage" in parts and "sessions" in parts and rel.suffix == ".sess":
         return True
     return False
@@ -136,6 +145,7 @@ def upload_tree(
     local_root: Path,
     remote_root: str,
 ) -> int:
+    """Upload every file over SFTP (slow; use deploy_archive unless debugging)."""
     count = 0
     for path in local_root.rglob("*"):
         rel = path.relative_to(local_root)
@@ -149,6 +159,36 @@ def upload_tree(
         sftp.put(str(path), remote)
         count += 1
     return count
+
+
+def deploy_archive(
+    client: paramiko.SSHClient,
+    sftp: paramiko.SFTPClient,
+    local_zip: Path,
+    remote_root: str,
+    file_count: int,
+) -> None:
+    remote_zip = posixpath.join(remote_root, REMOTE_ZIP_NAME)
+    mb = local_zip.stat().st_size / (1024 * 1024)
+    print(f"Uploading archive ({mb:.1f} MB, {file_count} files)...")
+    ssh_mkdirs(client, remote_root)
+    sftp.put(str(local_zip), remote_zip)
+    cmd = (
+        f"cd {shell_quote(remote_root)} && "
+        f"unzip -o -q {shell_quote(remote_zip)} && "
+        f"rm -f {shell_quote(remote_zip)}"
+    )
+    code, out, err = run(client, cmd)
+    if code != 0:
+        run(client, f"rm -f {shell_quote(remote_zip)}")
+        msg = (err or out or "unzip failed").strip()
+        print(
+            f"Remote extract failed (code {code}): {msg}\n"
+            "Retry with --legacy-upload to push files one-by-one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print("Extracted archive on server.")
 
 
 def write_remote_env(sftp: paramiko.SFTPClient, remote_root: str) -> None:
@@ -236,6 +276,11 @@ def main() -> None:
     parser.add_argument("--import-db", action="store_true", help="Run schema.sql + seed.sql on server")
     parser.add_argument("--pack-only", action="store_true", help="Build deploy zip only (no SSH)")
     parser.add_argument(
+        "--legacy-upload",
+        action="store_true",
+        help="Upload each file over SFTP instead of one zip (slow)",
+    )
+    parser.add_argument(
         "--zip",
         type=Path,
         default=ROOT / "clearance-hostinger-deploy.zip",
@@ -255,10 +300,20 @@ def main() -> None:
 
         sftp = client.open_sftp()
         try:
-            ssh_mkdirs(client, remote)
-            uploaded = upload_tree(client, sftp, ROOT, remote)
-            write_remote_env(sftp, remote)
-            print(f"Uploaded {uploaded} files")
+            if args.legacy_upload:
+                ssh_mkdirs(client, remote)
+                uploaded = upload_tree(client, sftp, ROOT, remote)
+                write_remote_env(sftp, remote)
+                print(f"Uploaded {uploaded} files (legacy mode)")
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                    zip_path = Path(tmp.name)
+                try:
+                    file_count = create_zip(zip_path)
+                    deploy_archive(client, sftp, zip_path, remote, file_count)
+                finally:
+                    zip_path.unlink(missing_ok=True)
+                write_remote_env(sftp, remote)
         finally:
             sftp.close()
 
