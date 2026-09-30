@@ -47,12 +47,14 @@ Create `.env` in the site root (same folder as `index.php`). Copy from `.env.exa
 cd c:\xampp\htdocs\CLEARANCE
 $env:DEPLOY_SSH_PASSWORD = "your-ssh-password"
 $env:DB_PASSWORD = "your-mysql-password"
-# optional: $env:DEPLOY_REMOTE_DIR = "/home/u899628465/domains/example.com/public_html"
-# optional: $env:APP_BASE_URL = "https://example.com"
-python tools/deploy_hostinger.py --import-db
+# optional: $env:DEPLOY_SITE_DOMAIN = "clearancesas.online"
+# optional: $env:APP_BASE_URL = "https://clearancesas.online"
+python tools/deploy_hostinger.py
 ```
 
-SSH defaults: host `109.106.254.155`, port `65002`, user `u899628465` (override with `DEPLOY_SSH_*`).
+Add `--import-db` only for a fresh database (runs `schema.sql` and `seed.sql`).
+
+SSH defaults: host `109.106.254.155`, port `65002`, user `u899628465` (override with `DEPLOY_SSH_*`). Deploy targets `clearancesas.online` unless `DEPLOY_SITE_DOMAIN` or `DEPLOY_REMOTE_DIR` is set.
 
 If SSH login fails, reset the SSH password in hPanel → **Advanced → SSH Access** and confirm SSH is **Enabled**.
 

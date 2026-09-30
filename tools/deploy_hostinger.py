@@ -32,6 +32,11 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent.parent
 
+DEFAULT_SITE_DOMAIN = "clearancesas.online"
+DEFAULT_APP_BASE_URL = f"https://{DEFAULT_SITE_DOMAIN}"
+DEFAULT_DB_NAME = "u899628465_wpu_clearance"
+DEFAULT_DB_USER = "u899628465_wpu_clearance"
+
 SKIP_DIRS = {".git", "__pycache__", "node_modules"}
 SKIP_FILES = {".env", "Thumbs.db", ".DS_Store"}
 SKIP_SUFFIXES = {".sess", ".log"}
@@ -77,6 +82,17 @@ def detect_public_html(client: paramiko.SSHClient) -> str:
     if custom:
         return custom.rstrip("/")
 
+    domain = env("DEPLOY_SITE_DOMAIN", DEFAULT_SITE_DOMAIN)
+    if domain:
+        cmd = (
+            f'test -d "$HOME/domains/{domain}/public_html" '
+            f'&& echo "$HOME/domains/{domain}/public_html"'
+        )
+        code, out, _ = run(client, cmd)
+        path = out.strip()
+        if code == 0 and path:
+            return path
+
     code, out, _ = run(client, "find \"$HOME\"/domains -maxdepth 2 -type d -name public_html 2>/dev/null | head -1")
     path = out.strip()
     if code == 0 and path:
@@ -103,24 +119,23 @@ def should_skip(rel: Path) -> bool:
     return False
 
 
-def sftp_mkdirs(sftp: paramiko.SFTPClient, remote_dir: str) -> None:
-    remote_dir = remote_dir.replace("\\", "/")
+def shell_quote(path: str) -> str:
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def ssh_mkdirs(client: paramiko.SSHClient, remote_dir: str) -> None:
+    remote_dir = remote_dir.replace("\\", "/").rstrip("/")
     if remote_dir in ("", "/"):
         return
-    parts = remote_dir.split("/")
-    built = ""
-    for part in parts:
-        if part == "":
-            built = "/"
-            continue
-        built = posixpath.join(built, part) if built != "/" else "/" + part
-        try:
-            sftp.stat(built)
-        except OSError:
-            sftp.mkdir(built)
+    run(client, f"mkdir -p {shell_quote(remote_dir)}")
 
 
-def upload_tree(sftp: paramiko.SFTPClient, local_root: Path, remote_root: str) -> int:
+def upload_tree(
+    client: paramiko.SSHClient,
+    sftp: paramiko.SFTPClient,
+    local_root: Path,
+    remote_root: str,
+) -> int:
     count = 0
     for path in local_root.rglob("*"):
         rel = path.relative_to(local_root)
@@ -128,9 +143,9 @@ def upload_tree(sftp: paramiko.SFTPClient, local_root: Path, remote_root: str) -
             continue
         remote = posixpath.join(remote_root, rel.as_posix())
         if path.is_dir():
-            sftp_mkdirs(sftp, remote)
+            ssh_mkdirs(client, remote)
             continue
-        sftp_mkdirs(sftp, posixpath.dirname(remote))
+        ssh_mkdirs(client, posixpath.dirname(remote))
         sftp.put(str(path), remote)
         count += 1
     return count
@@ -139,8 +154,8 @@ def upload_tree(sftp: paramiko.SFTPClient, local_root: Path, remote_root: str) -
 def write_remote_env(sftp: paramiko.SFTPClient, remote_root: str) -> None:
     db_host = env("DB_HOST", "127.0.0.1")
     db_port = env("DB_PORT", "3306")
-    db_name = env("DB_NAME", "u899628465_Clearance_2027")
-    db_user = env("DB_USER", "u899628465_Clearance_2027")
+    db_name = env("DB_NAME", DEFAULT_DB_NAME)
+    db_user = env("DB_USER", DEFAULT_DB_USER)
     db_password = env("DB_PASSWORD")
     if not db_password:
         print("Set DB_PASSWORD for remote .env", file=sys.stderr)
@@ -148,7 +163,7 @@ def write_remote_env(sftp: paramiko.SFTPClient, remote_root: str) -> None:
 
     app_env = env("APP_ENV", "production")
     app_debug = env("APP_DEBUG", "0")
-    app_base = env("APP_BASE_URL", "")
+    app_base = env("APP_BASE_URL", DEFAULT_APP_BASE_URL)
 
     lines = [
         f"DB_HOST={db_host}",
@@ -181,8 +196,8 @@ def chmod_storage(client: paramiko.SSHClient, remote_root: str) -> None:
 
 
 def import_database(client: paramiko.SSHClient, remote_root: str) -> None:
-    db_name = env("DB_NAME", "u899628465_Clearance_2027")
-    db_user = env("DB_USER", "u899628465_Clearance_2027")
+    db_name = env("DB_NAME", DEFAULT_DB_NAME)
+    db_user = env("DB_USER", DEFAULT_DB_USER)
     db_password = env("DB_PASSWORD")
     if not db_password:
         print("Set DB_PASSWORD to import DB", file=sys.stderr)
@@ -240,8 +255,8 @@ def main() -> None:
 
         sftp = client.open_sftp()
         try:
-            sftp_mkdirs(sftp, remote)
-            uploaded = upload_tree(sftp, ROOT, remote)
+            ssh_mkdirs(client, remote)
+            uploaded = upload_tree(client, sftp, ROOT, remote)
             write_remote_env(sftp, remote)
             print(f"Uploaded {uploaded} files")
         finally:
