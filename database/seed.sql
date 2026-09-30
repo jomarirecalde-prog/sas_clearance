@@ -48,11 +48,11 @@ VALUES
     '2',
     1
 ),
-(NULL, 'Ssc', 'Officer', 'ssc@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, 1),
-(NULL, 'Library', 'Officer', 'library@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, 1),
-(NULL, 'Sas', 'Officer', 'sas@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, 1),
-(NULL, 'Dean', 'Officer', 'dean@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, 1),
-(NULL, 'System', 'Admin', 'admin@wpu.edu.ph', '$2y$10$QGobjMI8Tegp/r5.7sCSNubQBXAxyaS8oPtkvjwtoRYwPdnIZ/7Wy', 'admin', NULL, NULL, NULL, 1);
+(NULL, 'Ssc', 'Officer', 'ssc@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, NULL, 1),
+(NULL, 'Library', 'Officer', 'library@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, NULL, 1),
+(NULL, 'Sas', 'Officer', 'sas@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, NULL, 1),
+(NULL, 'Dean', 'Officer', 'dean@wpu.edu.ph', '$2y$10$oaANWmHsp5/ycVpD78oz7OX0UjrTj14os0BmeOLBKcU73HG0DzbnO', 'signatory', NULL, NULL, NULL, NULL, 1),
+(NULL, 'System', 'Admin', 'admin@wpu.edu.ph', '$2y$10$QGobjMI8Tegp/r5.7sCSNubQBXAxyaS8oPtkvjwtoRYwPdnIZ/7Wy', 'admin', NULL, NULL, NULL, NULL, 1);
 
 -- Example requirement templates for current open semester.
 INSERT INTO office_requirements (semester_id, office_id, title, description, is_required, is_active)

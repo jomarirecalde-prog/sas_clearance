@@ -5,6 +5,8 @@ declare(strict_types=1);
 if (file_exists(__DIR__ . '/../vendor/autoload.php')) {
     require_once __DIR__ . '/../vendor/autoload.php';
 }
+require_once __DIR__ . '/../src/Config/LoadLocalEnv.php';
+\App\Config\LoadLocalEnv::load(dirname(__DIR__) . '/.env');
 require_once __DIR__ . '/../src/Config/Database.php';
 require_once __DIR__ . '/../src/Services/ClearanceService.php';
 require_once __DIR__ . '/../src/Services/StudentCsvImporter.php';

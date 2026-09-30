@@ -13,7 +13,7 @@ final class Database
     private const DEFAULT_PORT = 3306;
     private const DEFAULT_DBNAME = 'wpu_clearance';
     private const DEFAULT_USERNAME = 'root';
-    private const DEFAULT_PASSWORD = '';
+    private const DEFAULT_PASSWORD = 'password';
 
     public static function pdo(): PDO
     {
