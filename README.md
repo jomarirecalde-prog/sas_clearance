@@ -40,18 +40,16 @@ Web-based University Clearance System starter project for **Western Philippines 
 2. Import scripts:
    - `database/schema.sql`
    - `database/seed.sql`
-3. Configure DB in `src/Config/Database.php`.
+3. Configure DB via environment variables (see `.env.example`). Local XAMPP defaults remain `root` / empty password if unset.
 4. Ensure upload directory exists:
    - `storage/uploads`
 5. Point Apache virtual host/document root to:
    - `c:/xampp/htdocs/CLEARANCE/public`
-6. Use seeded demo credentials (all password: `Password123!`):
-   - Student: `student@wpu.edu.ph`
-   - Signatory (SSC): `ssc@wpu.edu.ph`
-   - Signatory (Library): `library@wpu.edu.ph`
-   - Signatory (SAS): `sas@wpu.edu.ph`
-   - Signatory (Dean): `dean@wpu.edu.ph`
-   - Admin: `admin@wpu.edu.ph`
+6. Seed data is **development only**. Never use these accounts in production. Demo passwords by role:
+   - Students: `Student!Dev26` (`student@wpu.edu.ph` and other seeded students)
+   - Signatories: `Signatory!Dev26` (`ssc@wpu.edu.ph`, `library@wpu.edu.ph`, `sas@wpu.edu.ph`, `dean@wpu.edu.ph`)
+   - Admin: `Admin!Dev26` (`admin@wpu.edu.ph`)
+   If you already imported the old seed (password `password`), run `database/migration_dev_passwords.sql`.
 
 ## API starter routes
 

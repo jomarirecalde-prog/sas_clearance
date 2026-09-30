@@ -1,5 +1,8 @@
 RewriteEngine On
 
+# Block raw access to application internals on subdirectory installs.
+RewriteRule ^(storage|src|database|vendor|scripts)/ - [F,L]
+
 # Keep direct files/folders at project root accessible.
 RewriteCond %{REQUEST_FILENAME} -f [OR]
 RewriteCond %{REQUEST_FILENAME} -d

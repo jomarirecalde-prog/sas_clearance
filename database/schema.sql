@@ -27,6 +27,7 @@ CREATE TABLE users (
     role ENUM('student', 'signatory', 'admin') NOT NULL,
     college_id BIGINT UNSIGNED NULL,
     program_id BIGINT UNSIGNED NULL,
+    campus ENUM('puerto_princesa', 'quezon', 'rio_tuba', 'el_nido', 'canique', 'busuanga') NULL,
     year_level ENUM('1', '2', '3', '4', '5+') NULL,
     student_account_type ENUM('paying_tuition', 'not_paying_tuition') NULL,
     student_org_position ENUM('president', 'vice_president', 'treasurer', 'secretary', 'auditor', 'na') NULL,
@@ -248,3 +249,14 @@ CREATE TABLE clearance_message_thread_reads (
     CONSTRAINT fk_cmtr_thread FOREIGN KEY (thread_id) REFERENCES clearance_message_threads(id) ON DELETE CASCADE,
     CONSTRAINT fk_cmtr_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE TABLE auth_rate_limits (
+    limiter_key CHAR(64) NOT NULL,
+    action VARCHAR(40) NOT NULL,
+    attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    window_started_at DATETIME NOT NULL,
+    locked_until DATETIME NULL,
+    updated_at DATETIME NOT NULL,
+    PRIMARY KEY (limiter_key),
+    INDEX idx_auth_rate_limits_locked_until (locked_until)
+) ENGINE=InnoDB;

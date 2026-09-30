@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Security\Crypto;
+use App\Security\PasswordHasher;
+use App\Security\RateLimiter;
 use App\Support\SignatureImage;
 use DateTime;
 use PDO;
@@ -26,10 +29,12 @@ final class ClearanceService
         $this->ensureStudentOfficeRequirementAttachmentColumns();
         $this->ensureSemesterDeadlineColumns();
         $this->ensureSemesterDeadlineNotificationLogTable();
+        RateLimiter::ensureSchema($this->pdo);
     }
 
     public function authenticate(string $email, string $password): ?array
     {
+        $email = strtolower(trim($email));
         $stmt = $this->pdo->prepare("
             SELECT id, first_name, last_name, email, role, password_hash, is_active
             FROM users
@@ -39,15 +44,33 @@ final class ClearanceService
         $stmt->execute(['email' => $email]);
         $user = $stmt->fetch();
         if (!$user || (int) $user['is_active'] !== 1) {
+            PasswordHasher::dummyVerify($password);
             return null;
         }
 
-        if (!password_verify($password, (string) $user['password_hash'])) {
+        $hash = (string) $user['password_hash'];
+        if (!PasswordHasher::verify($password, $hash)) {
             return null;
+        }
+
+        if (PasswordHasher::needsRehash($hash)) {
+            $this->upgradePasswordHash((int) $user['id'], $password);
         }
 
         unset($user['password_hash']);
         return $user;
+    }
+
+    private function upgradePasswordHash(int $userId, string $password): void
+    {
+        if ($userId <= 0) {
+            return;
+        }
+        $update = $this->pdo->prepare('UPDATE users SET password_hash = :password_hash WHERE id = :id LIMIT 1');
+        $update->execute([
+            'password_hash' => PasswordHasher::hash($password),
+            'id' => $userId,
+        ]);
     }
 
     public function createPasswordResetToken(string $email, int $ttlMinutes = 30): ?string
@@ -65,7 +88,7 @@ final class ClearanceService
         }
 
         $token = bin2hex(random_bytes(32));
-        $tokenHash = hash('sha256', $token);
+        $tokenHash = Crypto::hmac($token);
         $expiresAt = (new DateTime('+' . max(5, $ttlMinutes) . ' minutes'))->format('Y-m-d H:i:s');
 
         // Keep only one active token per user to simplify validation.
@@ -97,7 +120,7 @@ final class ClearanceService
         if (trim($token) === '') {
             return false;
         }
-        $tokenHash = hash('sha256', $token);
+        $tokenHash = Crypto::hmac($token);
         $stmt = $this->pdo->prepare("
             SELECT id
             FROM password_resets
@@ -119,7 +142,7 @@ final class ClearanceService
             return ['ok' => false, 'message' => 'Invalid or expired reset link.'];
         }
 
-        $tokenHash = hash('sha256', $token);
+        $tokenHash = Crypto::hmac($token);
         $selectStmt = $this->pdo->prepare("
             SELECT id, user_id
             FROM password_resets
@@ -134,7 +157,7 @@ final class ClearanceService
             return ['ok' => false, 'message' => 'Invalid or expired reset link.'];
         }
 
-        $hash = password_hash($newPassword, PASSWORD_DEFAULT);
+        $hash = PasswordHasher::hash($newPassword);
         $this->pdo->beginTransaction();
         try {
             $updateUserStmt = $this->pdo->prepare("
@@ -189,7 +212,7 @@ final class ClearanceService
             $user['display_department'] = 'Administration';
         } elseif ($role === 'student') {
             $stmt = $this->pdo->prepare('
-                SELECT col.name AS college_name, pr.name AS program_name, u.year_level,
+                SELECT col.name AS college_name, pr.name AS program_name, u.year_level, u.campus,
                        u.student_no, u.student_account_type, u.student_org_position, u.student_staying
                 FROM users u
                 LEFT JOIN colleges col ON col.id = u.college_id
@@ -203,18 +226,21 @@ final class ClearanceService
             $user['student_account_type'] = trim((string) ($row['student_account_type'] ?? ''));
             $user['student_org_position'] = trim((string) ($row['student_org_position'] ?? ''));
             $user['student_staying'] = trim((string) ($row['student_staying'] ?? ''));
+            $user['campus'] = trim((string) ($row['campus'] ?? ''));
             $college = trim((string) ($row['college_name'] ?? ''));
             $program = trim((string) ($row['program_name'] ?? ''));
             $yl = trim((string) ($row['year_level'] ?? ''));
+            $campusLabel = self::campusDisplayLabel($user['campus']);
             $ylSuffix = $yl !== '' ? ' · Yr ' . $yl : '';
+            $campusSuffix = $campusLabel !== '' ? ' · ' . $campusLabel : '';
             if ($program !== '' && $college !== '') {
-                $user['display_department'] = $program . ' · ' . $college . $ylSuffix;
+                $user['display_department'] = $program . ' · ' . $college . $ylSuffix . $campusSuffix;
             } elseif ($program !== '') {
-                $user['display_department'] = $program . $ylSuffix;
+                $user['display_department'] = $program . $ylSuffix . $campusSuffix;
             } elseif ($college !== '') {
-                $user['display_department'] = $college . $ylSuffix;
+                $user['display_department'] = $college . $ylSuffix . $campusSuffix;
             } else {
-                $user['display_department'] = 'No college / program on file' . ($yl !== '' ? ' · Yr ' . $yl : '');
+                $user['display_department'] = 'No college / program on file' . ($yl !== '' ? ' · Yr ' . $yl : '') . $campusSuffix;
             }
         } elseif ($role === 'signatory') {
             if ($semesterId !== null) {
@@ -254,6 +280,133 @@ final class ClearanceService
         ");
         $rows = $stmt->fetchAll();
         return is_array($rows) ? $rows : [];
+    }
+
+    public function actorCanViewStudentClearance(int $actorId, string $role, int $studentId, int $semesterId): bool
+    {
+        if ($actorId <= 0 || $studentId <= 0) {
+            return false;
+        }
+        if ($role === 'admin') {
+            return true;
+        }
+        if ($role === 'student') {
+            return $actorId === $studentId;
+        }
+        if ($role === 'signatory') {
+            $office = $this->getSignatoryOffice($actorId, $semesterId);
+            if ($office === null) {
+                return false;
+            }
+
+            return $this->canSignatoryAccessStudent($actorId, (int) $office['id'], $studentId, $semesterId);
+        }
+
+        return false;
+    }
+
+    /**
+     * Object-level authorization for files under /storage/*.
+     */
+    public function userCanAccessStoredFile(array $user, string $relativePath, int $semesterId): bool
+    {
+        $role = (string) ($user['role'] ?? '');
+        $userId = (int) ($user['id'] ?? 0);
+        $relativePath = ltrim(str_replace('\\', '/', $relativePath), '/');
+        if ($userId <= 0 || $relativePath === '') {
+            return false;
+        }
+
+        if (str_starts_with($relativePath, 'storage/requirement-attachments/')) {
+            if ($this->pathExistsInTable('office_requirements', 'attachment_path', $relativePath)) {
+                return in_array($role, ['admin', 'signatory', 'student'], true);
+            }
+            $studentId = $this->fetchIntByPath(
+                'SELECT student_id FROM student_office_requirements WHERE attachment_path = :path LIMIT 1',
+                $relativePath
+            );
+            if ($studentId === null) {
+                return false;
+            }
+
+            return $this->actorCanViewStudentClearance($userId, $role, $studentId, $semesterId);
+        }
+
+        if (str_starts_with($relativePath, 'storage/uploads/')) {
+            $studentId = $this->fetchIntByPath(
+                'SELECT student_id FROM requirement_submissions WHERE file_path = :path LIMIT 1',
+                $relativePath
+            );
+            if ($studentId === null) {
+                return false;
+            }
+
+            return $this->actorCanViewStudentClearance($userId, $role, $studentId, $semesterId);
+        }
+
+        if (str_starts_with($relativePath, 'storage/signatory-signatures/')) {
+            if ($role === 'admin') {
+                return $this->pathExistsInTable('signatory_signatures', 'signature_file', $relativePath)
+                    || $this->pathExistsInTable('student_clearances', 'digital_signature_path', $relativePath);
+            }
+            if ($role === 'signatory') {
+                $ownerId = $this->fetchIntByPath(
+                    'SELECT signatory_user_id FROM signatory_signatures WHERE signature_file = :path LIMIT 1',
+                    $relativePath
+                );
+
+                return $ownerId === $userId;
+            }
+
+            return false;
+        }
+
+        if (str_starts_with($relativePath, 'storage/profile-photos/')) {
+            $ownerId = $this->fetchIntByPath(
+                'SELECT id FROM users WHERE profile_photo_path = :path LIMIT 1',
+                $relativePath
+            );
+            if ($ownerId === null) {
+                return false;
+            }
+
+            return $role === 'admin' || $ownerId === $userId;
+        }
+
+        return false;
+    }
+
+    private function fetchIntByPath(string $sql, string $relativePath): ?int
+    {
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute(['path' => $relativePath]);
+        $value = $stmt->fetchColumn();
+        if ($value === false || $value === null) {
+            return null;
+        }
+
+        return (int) $value;
+    }
+
+    private function pathExistsInTable(string $table, string $column, string $relativePath): bool
+    {
+        $allowed = [
+            'office_requirements' => 'attachment_path',
+            'student_office_requirements' => 'attachment_path',
+            'signatory_signatures' => 'signature_file',
+            'student_clearances' => 'digital_signature_path',
+            'requirement_submissions' => 'file_path',
+            'users' => 'profile_photo_path',
+        ];
+        if (($allowed[$table] ?? null) !== $column) {
+            return false;
+        }
+        $stmt = $this->pdo->prepare(
+            "SELECT 1 FROM {$table} WHERE {$column} = :path LIMIT 1"
+        );
+        $stmt->execute(['path' => $relativePath]);
+
+        return (bool) $stmt->fetchColumn();
     }
 
     public function getStudentClearanceOverview(int $studentId, int $semesterId): array
@@ -1028,7 +1181,8 @@ final class ClearanceService
         ?int $filterCollegeId = null,
         ?int $filterProgramId = null,
         ?string $filterYearLevel = null,
-        ?string $filterSearchName = null
+        ?string $filterSearchName = null,
+        ?string $filterStatus = null
     ): array {
         $office = $this->getSignatoryOffice($signatoryUserId, $semesterId);
         if (!$office) {
@@ -1040,11 +1194,13 @@ final class ClearanceService
             $filterProgramId = null;
             $filterYearLevel = null;
             $filterSearchName = null;
+            $filterStatus = null;
         } else {
             $filterCollegeId = ($filterCollegeId !== null && $filterCollegeId > 0) ? $filterCollegeId : null;
             $filterProgramId = ($filterProgramId !== null && $filterProgramId > 0) ? $filterProgramId : null;
             $filterYearLevel = $this->normalizeQueueYearLevelFilter($filterYearLevel);
             $filterSearchName = $this->normalizeQueueSearchNameFilter($filterSearchName);
+            $filterStatus = $this->normalizeQueueStatusFilter($filterStatus);
         }
         $requiredCollegeId = $this->getRequiredCollegeForSignatoryOffice($signatoryUserId, $office);
         if ($requiredCollegeId !== null) {
@@ -1082,6 +1238,14 @@ final class ClearanceService
             )';
             $bind['filter_search_name'] = $namePattern;
         }
+        if ($filterStatus !== null) {
+            if ($filterStatus === 'for_review') {
+                $extraWhere .= " AND COALESCE(sc.status, 'pending') IN ('pending', 'for_review')";
+            } else {
+                $extraWhere .= ' AND sc.status = :filter_status';
+                $bind['filter_status'] = $filterStatus;
+            }
+        }
 
         $stmt = $this->pdo->prepare("
             SELECT
@@ -1092,6 +1256,7 @@ final class ClearanceService
                 MAX(COALESCE(c.name, '')) AS college_name,
                 MAX(COALESCE(p.name, '')) AS program_name,
                 MAX(COALESCE(u.year_level, '')) AS year_level,
+                MAX(COALESCE(u.campus, '')) AS campus,
                 COALESCE(sc.status, 'pending') AS clearance_status,
                 MAX(rs.uploaded_at) AS latest_upload_at
             FROM users u
@@ -1112,7 +1277,7 @@ final class ClearanceService
             WHERE u.role = 'student'
               AND u.is_active = 1
             {$extraWhere}
-            GROUP BY u.id, u.student_no, u.first_name, u.last_name, u.year_level, sc.status
+            GROUP BY u.id, u.student_no, u.first_name, u.last_name, u.year_level, u.campus, sc.status
             ORDER BY latest_upload_at DESC, u.last_name ASC
         ");
         $stmt->execute($bind);
@@ -2693,6 +2858,24 @@ final class ClearanceService
         return $v;
     }
 
+    private function normalizeQueueStatusFilter(?string $raw): ?string
+    {
+        if ($raw === null) {
+            return null;
+        }
+        $v = strtolower(trim($raw));
+        if ($v === 'approved') {
+            $v = 'cleared';
+        } elseif ($v === 'disapproved') {
+            $v = 'rejected';
+        }
+        if (in_array($v, ['for_review', 'cleared', 'rejected'], true)) {
+            return $v;
+        }
+
+        return null;
+    }
+
     private function queueSearchLikePattern(string $term): string
     {
         $escaped = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $term);
@@ -2772,6 +2955,65 @@ final class ClearanceService
         return ['ok' => false, 'message' => 'Students staying must be WPU Dormitory, Outside Dormitory, or Commuter.', 'value' => null];
     }
 
+    /**
+     * @return array<string, string>
+     */
+    public static function campusOptions(): array
+    {
+        return [
+            'puerto_princesa' => 'Puerto Princesa City Campus',
+            'quezon' => 'Quezon Campus',
+            'rio_tuba' => 'Rio Tuba Extension School',
+            'el_nido' => 'El Nido Campus',
+            'canique' => 'Canique Extension School',
+            'busuanga' => 'Busuanga Campus',
+        ];
+    }
+
+    public static function campusDisplayLabel(?string $campus): string
+    {
+        $t = trim((string) $campus);
+        $labels = self::campusOptions();
+
+        return $labels[$t] ?? '';
+    }
+
+    /**
+     * @return array{ok:bool, message:string, value:?string}
+     */
+    private function normalizeStudentCampus(string $raw): array
+    {
+        $v = strtolower(trim($raw));
+        $v = preg_replace('/[\s\-]+/', '_', $v) ?? $v;
+        if ($v === '') {
+            return ['ok' => false, 'message' => 'Campus is required.', 'value' => null];
+        }
+        $map = [
+            'puerto_princesa' => 'puerto_princesa',
+            'puerto_princesa_city' => 'puerto_princesa',
+            'puerto_princesa_city_campus' => 'puerto_princesa',
+            'ppc' => 'puerto_princesa',
+            'ppc_campus' => 'puerto_princesa',
+            'quezon' => 'quezon',
+            'quezon_campus' => 'quezon',
+            'rio_tuba' => 'rio_tuba',
+            'rio_tuba_extension' => 'rio_tuba',
+            'rio_tuba_extension_school' => 'rio_tuba',
+            'el_nido' => 'el_nido',
+            'el_nido_campus' => 'el_nido',
+            'canique' => 'canique',
+            'canique_extension' => 'canique',
+            'canique_extension_school' => 'canique',
+            'busuanga' => 'busuanga',
+            'busuanga_campus' => 'busuanga',
+        ];
+        if (isset($map[$v])) {
+            return ['ok' => true, 'message' => '', 'value' => $map[$v]];
+        }
+
+        return ['ok' => false, 'message' => 'Campus must be Puerto Princesa City Campus, Quezon Campus, Rio Tuba Extension School, El Nido Campus, Canique Extension School, or Busuanga Campus.', 'value' => null];
+    }
+
     public function registerStudentWithCollegeProgram(
         string $studentNo,
         string $firstName,
@@ -2783,7 +3025,8 @@ final class ClearanceService
         string $yearLevel,
         string $studentAccountType,
         string $studentOrgPosition,
-        string $studentStaying
+        string $studentStaying,
+        string $campus
     ): array {
         $studentNo = trim($studentNo);
         $firstName = trim($firstName);
@@ -2818,6 +3061,10 @@ final class ClearanceService
         if (!$stayingNorm['ok']) {
             return ['ok' => false, 'message' => $stayingNorm['message']];
         }
+        $campusNorm = $this->normalizeStudentCampus($campus);
+        if (!$campusNorm['ok']) {
+            return ['ok' => false, 'message' => $campusNorm['message']];
+        }
 
         $validProgram = $this->pdo->prepare("
             SELECT 1
@@ -2848,12 +3095,12 @@ final class ClearanceService
             return ['ok' => false, 'message' => 'That student number is already in use.'];
         }
 
-        $hash = password_hash($password, PASSWORD_DEFAULT);
+        $hash = PasswordHasher::hash($password);
         $insert = $this->pdo->prepare("
             INSERT INTO users
-                (student_no, first_name, last_name, email, password_hash, role, college_id, program_id, year_level, student_account_type, student_org_position, student_staying, is_active)
+                (student_no, first_name, last_name, email, password_hash, role, college_id, program_id, campus, year_level, student_account_type, student_org_position, student_staying, is_active)
             VALUES
-                (:student_no, :first_name, :last_name, :email, :password_hash, 'student', :college_id, :program_id, :year_level, :student_account_type, :student_org_position, :student_staying, 1)
+                (:student_no, :first_name, :last_name, :email, :password_hash, 'student', :college_id, :program_id, :campus, :year_level, :student_account_type, :student_org_position, :student_staying, 1)
         ");
         $insert->execute([
             'student_no' => $studentNo,
@@ -2863,6 +3110,7 @@ final class ClearanceService
             'password_hash' => $hash,
             'college_id' => $collegeId,
             'program_id' => $programId,
+            'campus' => $campusNorm['value'],
             'year_level' => $ylNorm['value'],
             'student_account_type' => $acctNorm['value'],
             'student_org_position' => $orgNorm['value'],
@@ -2883,7 +3131,8 @@ final class ClearanceService
         string $yearLevel,
         string $studentAccountType = 'paying_tuition',
         string $studentOrgPosition = 'na',
-        string $studentStaying = 'commuter'
+        string $studentStaying = 'commuter',
+        string $campus = ''
     ): array {
         $collegeCode = strtoupper(trim($collegeCode));
         $programCode = strtoupper(trim($programCode));
@@ -2922,7 +3171,8 @@ final class ClearanceService
             $yearLevel,
             $studentAccountType,
             $studentOrgPosition,
-            $studentStaying
+            $studentStaying,
+            $campus
         );
     }
 
@@ -2942,6 +3192,7 @@ final class ClearanceService
                 u.student_account_type,
                 u.student_org_position,
                 u.student_staying,
+                u.campus,
                 c.name AS college_name,
                 pr.name AS program_name,
                 COALESCE(ssc.overall_status, 'pending') AS overall_status
@@ -2961,7 +3212,7 @@ final class ClearanceService
     public function getStudentByIdForAdmin(int $id): ?array
     {
         $stmt = $this->pdo->prepare("
-            SELECT id, student_no, first_name, last_name, email, college_id, program_id, year_level, student_account_type, student_org_position, student_staying, is_active
+            SELECT id, student_no, first_name, last_name, email, college_id, program_id, campus, year_level, student_account_type, student_org_position, student_staying, is_active
             FROM users
             WHERE id = :id AND role = 'student'
             LIMIT 1
@@ -2984,6 +3235,7 @@ final class ClearanceService
         string $studentAccountType,
         string $studentOrgPosition,
         string $studentStaying,
+        string $campus,
         ?string $newPassword
     ): array {
         $studentNo = trim($studentNo);
@@ -3014,6 +3266,10 @@ final class ClearanceService
         $stayingNorm = $this->normalizeStudentStaying($studentStaying);
         if (!$stayingNorm['ok']) {
             return ['ok' => false, 'message' => $stayingNorm['message']];
+        }
+        $campusNorm = $this->normalizeStudentCampus($campus);
+        if (!$campusNorm['ok']) {
+            return ['ok' => false, 'message' => $campusNorm['message']];
         }
         $exists = $this->pdo->prepare("SELECT 1 FROM users WHERE id = :id AND role = 'student' LIMIT 1");
         $exists->execute(['id' => $studentId]);
@@ -3050,7 +3306,7 @@ final class ClearanceService
             if (strlen($newPassword) < 8) {
                 return ['ok' => false, 'message' => 'New password must be at least 8 characters.'];
             }
-            $hash = password_hash($newPassword, PASSWORD_DEFAULT);
+            $hash = PasswordHasher::hash($newPassword);
             $stmt = $this->pdo->prepare("
                 UPDATE users SET
                     student_no = :student_no,
@@ -3063,6 +3319,7 @@ final class ClearanceService
                     student_account_type = :student_account_type,
                     student_org_position = :student_org_position,
                     student_staying = :student_staying,
+                    campus = :campus,
                     password_hash = :ph
                 WHERE id = :id AND role = 'student'
                 LIMIT 1
@@ -3078,6 +3335,7 @@ final class ClearanceService
                 'student_account_type' => $acctNorm['value'],
                 'student_org_position' => $orgNorm['value'],
                 'student_staying' => $stayingNorm['value'],
+                'campus' => $campusNorm['value'],
                 'ph' => $hash,
                 'id' => $studentId,
             ]);
@@ -3093,7 +3351,8 @@ final class ClearanceService
                     year_level = :year_level,
                     student_account_type = :student_account_type,
                     student_org_position = :student_org_position,
-                    student_staying = :student_staying
+                    student_staying = :student_staying,
+                    campus = :campus
                 WHERE id = :id AND role = 'student'
                 LIMIT 1
             ");
@@ -3108,6 +3367,7 @@ final class ClearanceService
                 'student_account_type' => $acctNorm['value'],
                 'student_org_position' => $orgNorm['value'],
                 'student_staying' => $stayingNorm['value'],
+                'campus' => $campusNorm['value'],
                 'id' => $studentId,
             ]);
         }
@@ -3610,7 +3870,7 @@ final class ClearanceService
         if ($dup->fetchColumn()) {
             return ['ok' => false, 'message' => 'That email is already registered.'];
         }
-        $hash = password_hash($password, PASSWORD_DEFAULT);
+        $hash = PasswordHasher::hash($password);
         $stmt = $this->pdo->prepare("
             INSERT INTO users
                 (student_no, first_name, last_name, email, password_hash, role, college_id, program_id, year_level, is_active)
@@ -3677,7 +3937,7 @@ final class ClearanceService
             if (strlen($newPassword) < 8) {
                 return ['ok' => false, 'message' => 'New password must be at least 8 characters.'];
             }
-            $hash = password_hash($newPassword, PASSWORD_DEFAULT);
+            $hash = PasswordHasher::hash($newPassword);
             $stmt = $this->pdo->prepare("
                 UPDATE users
                 SET first_name = :fn, last_name = :ln, email = :em, password_hash = :ph
@@ -3780,10 +4040,10 @@ final class ClearanceService
             if (strlen($newPassword) < 8) {
                 return ['ok' => false, 'message' => 'New password must be at least 8 characters.'];
             }
-            if ($currentPassword === '' || !password_verify($currentPassword, (string) $admin['password_hash'])) {
+            if ($currentPassword === '' || !PasswordHasher::verify($currentPassword, (string) $admin['password_hash'])) {
                 return ['ok' => false, 'message' => 'Current password is incorrect.'];
             }
-            $hash = password_hash($newPassword, PASSWORD_DEFAULT);
+            $hash = PasswordHasher::hash($newPassword);
             $update = $this->pdo->prepare("
                 UPDATE users
                 SET first_name = :fn, last_name = :ln, email = :em, password_hash = :ph
@@ -4121,6 +4381,7 @@ final class ClearanceService
                 u.last_name,
                 u.email,
                 u.year_level,
+                u.campus,
                 c.name AS college_name,
                 p.name AS program_name,
                 COALESCE(ssc.overall_status, 'pending') AS overall_status
@@ -4139,10 +4400,13 @@ final class ClearanceService
 
     public function getAdminClearanceReport(
         int $semesterId,
-        ?string $overallStatus = null
+        ?string $overallStatus = null,
+        ?string $campus = null
     ): array {
         $allowedStatuses = ['pending', 'for_review', 'cleared', 'rejected'];
         $overallFilter = in_array((string) $overallStatus, $allowedStatuses, true) ? $overallStatus : null;
+        $campusNorm = $campus !== null && trim($campus) !== '' ? $this->normalizeStudentCampus($campus) : null;
+        $campusFilter = ($campusNorm !== null && $campusNorm['ok']) ? $campusNorm['value'] : null;
 
         $sql = "
             SELECT
@@ -4154,6 +4418,7 @@ final class ClearanceService
                 COALESCE(col.name, '') AS college_name,
                 COALESCE(pr.name, '') AS program_name,
                 COALESCE(u.year_level, '') AS year_level,
+                COALESCE(u.campus, '') AS campus,
                 COALESCE(ssc.overall_status, 'pending') AS overall_status
             FROM users u
             LEFT JOIN colleges col ON col.id = u.college_id
@@ -4169,6 +4434,10 @@ final class ClearanceService
             $sql .= " AND COALESCE(ssc.overall_status, 'pending') = :overall_status";
             $bindings['overall_status'] = $overallFilter;
         }
+        if ($campusFilter !== null) {
+            $sql .= ' AND u.campus = :campus';
+            $bindings['campus'] = $campusFilter;
+        }
 
         $sql .= " ORDER BY u.last_name, u.first_name";
         $stmt = $this->pdo->prepare($sql);
@@ -4176,10 +4445,265 @@ final class ClearanceService
         return $stmt->fetchAll();
     }
 
+    /**
+     * Admin monitor: which offices still need to clear each student.
+     *
+     * @return array{
+     *   offices: list<array<string,mixed>>,
+     *   students: list<array<string,mixed>>,
+     *   stats: array{total_students:int, students_with_pending:int, fully_cleared:int}
+     * }
+     */
+    public function getAdminPendingDepartmentMonitor(
+        int $semesterId,
+        ?int $officeId = null,
+        ?string $campus = null,
+        ?int $collegeId = null,
+        ?int $programId = null,
+        ?string $yearLevel = null,
+        ?string $searchName = null,
+        ?string $officeStatus = null
+    ): array {
+        $officeId = ($officeId !== null && $officeId > 0) ? $officeId : null;
+        $collegeId = ($collegeId !== null && $collegeId > 0) ? $collegeId : null;
+        $programId = ($programId !== null && $programId > 0) ? $programId : null;
+        $yearLevel = $this->normalizeQueueYearLevelFilter($yearLevel);
+        $searchName = $this->normalizeQueueSearchNameFilter($searchName);
+        $officeStatus = $this->normalizePendingOfficeStatusFilter($officeStatus);
+
+        $campusNorm = $campus !== null && trim($campus) !== '' ? $this->normalizeStudentCampus($campus) : null;
+        $campusFilter = ($campusNorm !== null && $campusNorm['ok']) ? $campusNorm['value'] : null;
+
+        $officesStmt = $this->pdo->query("
+            SELECT
+                o.id,
+                o.code,
+                o.name,
+                o.sequence_no,
+                o.parent_office_id,
+                p.name AS parent_name
+            FROM offices o
+            LEFT JOIN offices p ON p.id = o.parent_office_id
+            WHERE o.is_active = 1
+            ORDER BY o.sequence_no ASC, o.name ASC
+        ");
+        $officeRows = $officesStmt->fetchAll();
+        $officeStats = [];
+        foreach ($officeRows as $office) {
+            $oid = (int) ($office['id'] ?? 0);
+            if ($oid <= 0) {
+                continue;
+            }
+            $officeStats[$oid] = [
+                'office_id' => $oid,
+                'office_code' => (string) ($office['code'] ?? ''),
+                'office_name' => (string) ($office['name'] ?? ''),
+                'parent_name' => (string) ($office['parent_name'] ?? ''),
+                'sequence_no' => (int) ($office['sequence_no'] ?? 0),
+                'pending' => 0,
+                'for_review' => 0,
+                'rejected' => 0,
+                'incomplete' => 0,
+            ];
+        }
+
+        $extraWhere = '';
+        $bindings = [
+            'semester_id' => $semesterId,
+            'semester_id_2' => $semesterId,
+            'acct_code' => self::ACCOUNTING_OFFICE_CODE,
+            'dorm_code' => self::DORMITORY_OFFICE_CODE,
+        ];
+        if ($campusFilter !== null) {
+            $extraWhere .= ' AND u.campus = :campus';
+            $bindings['campus'] = $campusFilter;
+        }
+        if ($collegeId !== null) {
+            $extraWhere .= ' AND u.college_id = :college_id';
+            $bindings['college_id'] = $collegeId;
+        }
+        if ($programId !== null) {
+            $extraWhere .= ' AND u.program_id = :program_id';
+            $bindings['program_id'] = $programId;
+        }
+        if ($yearLevel !== null) {
+            $extraWhere .= ' AND u.year_level = :year_level';
+            $bindings['year_level'] = $yearLevel;
+        }
+        if ($searchName !== null) {
+            $namePattern = $this->queueSearchLikePattern($searchName);
+            $extraWhere .= ' AND (
+                u.first_name LIKE :search_name
+                OR u.last_name LIKE :search_name
+                OR u.student_no LIKE :search_name
+                OR CONCAT(u.first_name, \' \', u.last_name) LIKE :search_name
+                OR CONCAT(u.last_name, \', \', u.first_name) LIKE :search_name
+            )';
+            $bindings['search_name'] = $namePattern;
+        }
+
+        $sql = "
+            SELECT
+                u.id AS student_id,
+                u.student_no,
+                u.first_name,
+                u.last_name,
+                u.email,
+                COALESCE(u.year_level, '') AS year_level,
+                COALESCE(u.campus, '') AS campus,
+                COALESCE(col.name, '') AS college_name,
+                COALESCE(pr.name, '') AS program_name,
+                COALESCE(ssc.overall_status, 'pending') AS overall_status,
+                o.id AS office_id,
+                o.code AS office_code,
+                o.name AS office_name,
+                o.sequence_no,
+                COALESCE(p.name, '') AS parent_name,
+                COALESCE(sc.status, 'pending') AS office_status
+            FROM users u
+            LEFT JOIN colleges col ON col.id = u.college_id
+            LEFT JOIN programs pr ON pr.id = u.program_id
+            LEFT JOIN student_semester_clearances ssc
+                ON ssc.student_id = u.id
+               AND ssc.semester_id = :semester_id
+            INNER JOIN offices o ON o.is_active = 1
+            LEFT JOIN offices p ON p.id = o.parent_office_id
+            LEFT JOIN student_clearances sc
+                ON sc.student_id = u.id
+               AND sc.office_id = o.id
+               AND sc.semester_id = :semester_id_2
+            WHERE u.role = 'student'
+              AND u.is_active = 1
+              AND NOT (
+                    UPPER(o.code) = :acct_code
+                AND COALESCE(u.student_account_type, 'paying_tuition') = 'not_paying_tuition'
+              )
+              AND NOT (
+                    UPPER(o.code) = :dorm_code
+                AND COALESCE(u.student_staying, '') <> 'wpu_dormitory'
+              )
+              {$extraWhere}
+            ORDER BY u.last_name, u.first_name, o.sequence_no, o.name
+        ";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($bindings);
+
+        $students = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $studentId = (int) ($row['student_id'] ?? 0);
+            if ($studentId <= 0) {
+                continue;
+            }
+            if (!isset($students[$studentId])) {
+                $students[$studentId] = [
+                    'student_id' => $studentId,
+                    'student_no' => (string) ($row['student_no'] ?? ''),
+                    'first_name' => (string) ($row['first_name'] ?? ''),
+                    'last_name' => (string) ($row['last_name'] ?? ''),
+                    'email' => (string) ($row['email'] ?? ''),
+                    'year_level' => (string) ($row['year_level'] ?? ''),
+                    'campus' => (string) ($row['campus'] ?? ''),
+                    'college_name' => (string) ($row['college_name'] ?? ''),
+                    'program_name' => (string) ($row['program_name'] ?? ''),
+                    'overall_status' => (string) ($row['overall_status'] ?? 'pending'),
+                    'pending_offices' => [],
+                ];
+            }
+
+            $status = strtolower(trim((string) ($row['office_status'] ?? 'pending')));
+            if ($status === 'cleared') {
+                continue;
+            }
+            if (!in_array($status, ['pending', 'for_review', 'rejected'], true)) {
+                $status = 'pending';
+            }
+
+            $oid = (int) ($row['office_id'] ?? 0);
+            $officeEntry = [
+                'office_id' => $oid,
+                'office_code' => (string) ($row['office_code'] ?? ''),
+                'office_name' => (string) ($row['office_name'] ?? ''),
+                'parent_name' => (string) ($row['parent_name'] ?? ''),
+                'status' => $status,
+            ];
+            $students[$studentId]['pending_offices'][] = $officeEntry;
+
+            if (isset($officeStats[$oid])) {
+                $officeStats[$oid]['incomplete']++;
+                $officeStats[$oid][$status]++;
+            }
+        }
+
+        $fullyCleared = 0;
+        $withPending = 0;
+        $filtered = [];
+        foreach ($students as $student) {
+            $pendingOffices = $student['pending_offices'];
+            if ($pendingOffices === []) {
+                $fullyCleared++;
+                continue;
+            }
+            $withPending++;
+            if ($officeId !== null) {
+                $matchesOffice = false;
+                foreach ($pendingOffices as $pendingOffice) {
+                    if ((int) ($pendingOffice['office_id'] ?? 0) !== $officeId) {
+                        continue;
+                    }
+                    if ($officeStatus !== null && (string) ($pendingOffice['status'] ?? '') !== $officeStatus) {
+                        continue;
+                    }
+                    $matchesOffice = true;
+                    break;
+                }
+                if (!$matchesOffice) {
+                    continue;
+                }
+            } elseif ($officeStatus !== null) {
+                $matchesStatus = false;
+                foreach ($pendingOffices as $pendingOffice) {
+                    if ((string) ($pendingOffice['status'] ?? '') === $officeStatus) {
+                        $matchesStatus = true;
+                        break;
+                    }
+                }
+                if (!$matchesStatus) {
+                    continue;
+                }
+            }
+            $filtered[] = $student;
+        }
+
+        return [
+            'offices' => array_values($officeStats),
+            'students' => $filtered,
+            'stats' => [
+                'total_students' => count($students),
+                'students_with_pending' => $withPending,
+                'fully_cleared' => $fullyCleared,
+            ],
+        ];
+    }
+
+    private function normalizePendingOfficeStatusFilter(?string $raw): ?string
+    {
+        if ($raw === null) {
+            return null;
+        }
+        $v = strtolower(trim($raw));
+        if ($v === 'approved') {
+            $v = 'cleared';
+        } elseif ($v === 'disapproved') {
+            $v = 'rejected';
+        }
+
+        return in_array($v, ['pending', 'for_review', 'rejected'], true) ? $v : null;
+    }
+
     public function getFinalClearanceData(int $studentId, int $semesterId): ?array
     {
         $studentStmt = $this->pdo->prepare("
-            SELECT id, student_no, first_name, last_name, email, year_level
+            SELECT id, student_no, first_name, last_name, email, year_level, campus
             FROM users
             WHERE id = :student_id AND role = 'student'
             LIMIT 1

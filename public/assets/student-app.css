@@ -1,0 +1,363 @@
+:root {
+  --sapp-bg: #eef3f6;
+  --sapp-surface: #ffffff;
+  --sapp-ink: #0f2a37;
+  --sapp-muted: #5b6e7c;
+  --sapp-line: #dbe5ec;
+  --sapp-brand: #0f3b4f;
+  --sapp-brand-2: #1f6390;
+  --sapp-accent: #ffb947;
+  --sapp-danger: #b91c1c;
+  --sapp-topbar: 58px;
+  --sapp-sidenav: 232px;
+  --sapp-tabbar: 64px;
+}
+
+body.student-app {
+  background: var(--sapp-bg);
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+body.student-app-auth {
+  background:
+    linear-gradient(160deg, rgba(7, 24, 35, 0.72) 0%, rgba(15, 59, 79, 0.78) 55%, rgba(31, 99, 144, 0.7) 100%),
+    #0f3b4f;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+}
+
+body.student-app-auth .login-shell,
+body.student-app-auth main {
+  width: 100%;
+  max-width: 430px;
+  margin: 0 auto;
+  padding: 0;
+}
+
+.sapp-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  min-height: var(--sapp-topbar);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: calc(8px + env(safe-area-inset-top)) 16px 8px;
+  background: linear-gradient(95deg, var(--sapp-brand) 0%, var(--sapp-brand-2) 100%);
+  color: #fff;
+  box-shadow: 0 6px 18px rgba(15, 59, 79, 0.18);
+}
+
+.sapp-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sapp-brand-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: #fff;
+  color: var(--sapp-brand);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+
+.sapp-brand-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.sapp-brand-text {
+  min-width: 0;
+}
+
+.sapp-brand-text strong {
+  display: block;
+  font-size: 0.95rem;
+  line-height: 1.15;
+}
+
+.sapp-brand-text span {
+  display: block;
+  font-size: 0.72rem;
+  opacity: 0.82;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46vw;
+}
+
+.sapp-install-btn {
+  border: 0;
+  border-radius: 999px;
+  background: var(--sapp-accent);
+  color: #0f2a37;
+  font-weight: 700;
+  font-size: 0.78rem;
+  padding: 0.42rem 0.85rem;
+  display: none;
+}
+
+.sapp-install-btn.is-visible {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+body.sapp-installed .sapp-install-btn,
+body.sapp-installed .sapp-install-banner {
+  display: none !important;
+}
+
+.sapp-install-banner {
+  display: none;
+  margin: 0 0 1rem;
+  border: 1px solid #dbe7df;
+  background: #fff;
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.sapp-install-banner.is-visible {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sapp-install-banner p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--sapp-muted);
+}
+
+.sapp-install-banner strong {
+  display: block;
+  color: var(--sapp-ink);
+  margin-bottom: 2px;
+}
+
+.sapp-layout {
+  display: block;
+}
+
+.sapp-sidenav {
+  display: none;
+}
+
+.sapp-main {
+  padding-bottom: calc(var(--sapp-tabbar) + env(safe-area-inset-bottom) + 16px);
+}
+
+.sapp-tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 50;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
+  background: rgba(255, 255, 255, 0.96);
+  border-top: 1px solid var(--sapp-line);
+  backdrop-filter: blur(10px);
+}
+
+.sapp-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 48px;
+  text-decoration: none;
+  color: #64748b;
+  font-size: 0.68rem;
+  font-weight: 600;
+  border-radius: 12px;
+  position: relative;
+}
+
+.sapp-tab i {
+  font-size: 1.05rem;
+}
+
+.sapp-tab.is-active,
+.sapp-tab:hover {
+  color: var(--sapp-brand);
+  background: #eef6fb;
+}
+
+.sapp-tab .sapp-badge {
+  position: absolute;
+  top: 4px;
+  right: calc(50% - 18px);
+  min-width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 0.62rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+
+.sapp-login {
+  background: #fff;
+  border-radius: 1.6rem;
+  padding: 1.4rem 1.25rem 1.2rem;
+  box-shadow: 0 24px 50px rgba(0, 0, 0, 0.22);
+}
+
+.sapp-login .input-group {
+  display: block;
+  width: 100%;
+}
+
+.sapp-login .sapp-install-banner {
+  margin-top: 1.15rem;
+}
+
+.sapp-login-hero {
+  text-align: center;
+  margin-bottom: 1.15rem;
+}
+
+.sapp-login-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 0.35rem;
+}
+
+.sapp-login-hero .sapp-brand-mark {
+  width: 48px;
+  height: 48px;
+  margin: 0;
+  border-radius: 50%;
+}
+
+.sapp-login-hero h1 {
+  font-size: 1.45rem;
+  font-weight: 800;
+  color: #0a2b3e;
+  margin: 0;
+}
+
+.sapp-login-hero p {
+  margin: 0;
+  color: #5a6e7c;
+  font-size: 0.9rem;
+}
+
+.sapp-only-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #fff8eb;
+  border: 1px solid #f3e0b8;
+  color: #8a5a12;
+  border-radius: 12px;
+  padding: 0.7rem 0.8rem;
+  font-size: 0.8rem;
+  margin-bottom: 1rem;
+}
+
+.sapp-staff-link {
+  display: block;
+  text-align: center;
+  margin-top: 1rem;
+  font-size: 0.8rem;
+  color: #1f6390;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.sapp-ios-help ol {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.82rem;
+  color: var(--sapp-muted);
+}
+
+@media (min-width: 992px) {
+  body.student-app {
+    overflow: hidden;
+    height: 100vh;
+  }
+
+  .sapp-layout {
+    display: flex;
+    height: calc(100vh - var(--sapp-topbar) - env(safe-area-inset-top));
+  }
+
+  .sapp-sidenav {
+    display: flex;
+    flex-direction: column;
+    width: var(--sapp-sidenav);
+    flex-shrink: 0;
+    background: #fff;
+    border-right: 1px solid var(--sapp-line);
+    padding: 18px 12px;
+    gap: 6px;
+    height: 100%;
+  }
+
+  .sapp-sidenav .sapp-tab {
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    font-size: 0.9rem;
+    min-height: 44px;
+  }
+
+  .sapp-sidenav .sapp-tab .sapp-badge {
+    position: static;
+    margin-left: auto;
+  }
+
+  .sapp-tabbar {
+    display: none;
+  }
+
+  .sapp-main {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    overflow-y: auto;
+    padding: 24px 28px 40px;
+  }
+
+  body.student-app .page-wrap {
+    max-width: 1080px;
+    padding-top: 0 !important;
+  }
+}
+
+@media (display-mode: standalone), (display-mode: minimal-ui) {
+  body.student-app .sapp-install-banner,
+  body.student-app-auth .sapp-install-banner {
+    display: none !important;
+  }
+}

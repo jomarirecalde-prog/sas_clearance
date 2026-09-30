@@ -14,7 +14,7 @@ final class StudentCsvImporter
 
 {
 
-    private const REQUIRED = ['student_no', 'email', 'password', 'college_code', 'program_code', 'year_level'];
+    private const REQUIRED = ['student_no', 'email', 'password', 'campus', 'college_code', 'program_code', 'year_level'];
 
 
 
@@ -283,6 +283,11 @@ final class StudentCsvImporter
                 $staying = $cell($row, $colIndex, 'students_staying');
             }
 
+            $campus = $cell($row, $colIndex, 'campus');
+            if ($campus === '' && isset($colIndex['campus_code'])) {
+                $campus = $cell($row, $colIndex, 'campus_code');
+            }
+
             $result = $this->clearance->registerStudentWithCollegeProgramByCodes(
 
                 $sn,
@@ -305,7 +310,9 @@ final class StudentCsvImporter
 
                 $orgPos,
 
-                $staying
+                $staying,
+
+                $campus
 
             );
 

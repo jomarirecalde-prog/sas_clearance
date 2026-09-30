@@ -1,0 +1,3 @@
+app.key
+sessions/*
+!sessions/.gitkeep

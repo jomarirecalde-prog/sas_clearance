@@ -2,23 +2,28 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/../src/Config/Database.php';
-require_once __DIR__ . '/../src/Services/ClearanceService.php';
-require_once __DIR__ . '/../src/Services/StudentCsvImporter.php';
 if (file_exists(__DIR__ . '/../vendor/autoload.php')) {
     require_once __DIR__ . '/../vendor/autoload.php';
 }
+require_once __DIR__ . '/../src/Config/Database.php';
+require_once __DIR__ . '/../src/Services/ClearanceService.php';
+require_once __DIR__ . '/../src/Services/StudentCsvImporter.php';
+require_once __DIR__ . '/../src/Support/StudentPwa.php';
 
 use App\Config\Database;
 use App\Mail\PasswordResetEmail;
+use App\Security\AuthLayer;
+use App\Security\RateLimiter;
 use App\Services\ClearanceService;
 use App\Services\StudentCsvImporter;
 use App\Support\SignatureImage;
+use App\Support\StudentPwa;
 
-session_start();
+AuthLayer::boot();
 
 $pdo = Database::pdo();
 $service = new ClearanceService($pdo);
+$rateLimiter = new RateLimiter($pdo);
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/index.php'));
@@ -59,17 +64,28 @@ function hasset(string $file): string
     return htmlspecialchars(asset_path($file), ENT_QUOTES, 'UTF-8');
 }
 
+function csrf_field(): string
+{
+    return AuthLayer::csrfField();
+}
+
 function capitalizeInputStart(string $value, bool $multiline = false): string
 {
     if ($value === '') {
         return $value;
     }
 
-    $pattern = $multiline ? '/(^|[\r\n]+)(\s*)([a-z])/u' : '/^(\s*)([a-z])/u';
+    if ($multiline) {
+        return (string) preg_replace_callback(
+            '/(^|[\r\n]+)(\s*)([a-z])/u',
+            static fn (array $m): string => $m[1] . $m[2] . mb_strtoupper((string) $m[3], 'UTF-8'),
+            $value
+        );
+    }
 
     return (string) preg_replace_callback(
-        $pattern,
-        static fn (array $m): string => $m[1] . $m[2] . mb_strtoupper($m[3], 'UTF-8'),
+        '/^(\s*)([a-z])/u',
+        static fn (array $m): string => $m[1] . mb_strtoupper((string) $m[2], 'UTF-8'),
         $value
     );
 }
@@ -103,6 +119,111 @@ if ($path !== '/') {
 
 $GLOBALS['_app_request_path'] = $path;
 
+if ($method === 'POST' && !AuthLayer::csrfIsValid()) {
+    $csrfError = AuthLayer::expired()
+        ? 'Your session expired. Please sign in again.'
+        : 'Your session expired or this request could not be verified. Please try again.';
+    if (isJsonApiPath($path) || requestWantsJson()) {
+        http_response_code(403);
+        json(['ok' => false, 'error' => $csrfError]);
+        exit;
+    }
+    if ($path === '/app') {
+        renderPage('Student App', renderStudentAppLogin($csrfError));
+        exit;
+    }
+    if ($path === '/forgot-password') {
+        renderPage('Forgot Password', renderForgotPasswordForm($csrfError, null));
+        exit;
+    }
+    if ($path === '/reset-password') {
+        renderPage('Reset Password', renderResetPasswordForm(trim((string) ($_POST['token'] ?? '')), $csrfError, null));
+        exit;
+    }
+    if ($path === '/login' || !isset($_SESSION['user'])) {
+        renderPage('Login', renderLoginForm($csrfError, buildLoginStats($service)));
+        exit;
+    }
+    $_SESSION['flash'] = $csrfError;
+    header('Location: ' . app_path('/dashboard'));
+    exit;
+}
+
+if ($path === '/manifest.webmanifest' && $method === 'GET') {
+    header('Content-Type: application/manifest+json; charset=utf-8');
+    header('Cache-Control: no-cache');
+    echo json_encode(StudentPwa::manifest($appBasePath, 'app_path'), JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+    exit;
+}
+
+if ($path === '/sw.js' && $method === 'GET') {
+    header('Content-Type: application/javascript; charset=utf-8');
+    header('Service-Worker-Allowed: ' . StudentPwa::scope($appBasePath));
+    header('Cache-Control: no-cache');
+    echo StudentPwa::serviceWorker($appBasePath, 'app_path');
+    exit;
+}
+
+if ($method === 'GET' && preg_match('#^/app/icon/(192|512)$#', $path, $iconMatch) === 1) {
+    $iconFile = StudentPwa::iconPath((int) $iconMatch[1]);
+    header('Content-Type: image/png');
+    header('Cache-Control: public, max-age=86400');
+    header('Content-Length: ' . (string) filesize($iconFile));
+    readfile($iconFile);
+    exit;
+}
+
+if ($path === '/app/offline' && $method === 'GET') {
+    header('Content-Type: text/html; charset=UTF-8');
+    echo StudentPwa::offlinePage('SAFE Student', app_path('/app'));
+    exit;
+}
+
+if ($path === '/app' && $method === 'GET') {
+    if (isset($_SESSION['user'])) {
+        if ((string) ($_SESSION['user']['role'] ?? '') === 'student') {
+            header('Location: ' . app_path('/dashboard'));
+            exit;
+        }
+        renderPage('Student App', renderStudentAppStaffBlocked($_SESSION['user']));
+        exit;
+    }
+    renderPage('Student App', renderStudentAppLogin(null));
+    exit;
+}
+
+if ($path === '/app' && $method === 'POST') {
+    if (isset($_SESSION['user']) && (string) ($_SESSION['user']['role'] ?? '') === 'student') {
+        header('Location: ' . app_path('/dashboard'));
+        exit;
+    }
+    $email = trim((string) ($_POST['email'] ?? ''));
+    $password = (string) ($_POST['password'] ?? '');
+    $ip = AuthLayer::clientIp();
+    $blocked = $rateLimiter->loginBlocked($ip, $email);
+    if ($blocked !== null) {
+        renderPage('Student App', renderStudentAppLogin($blocked));
+        exit;
+    }
+    $user = $service->authenticate($email, $password);
+    if (!$user) {
+        $rateLimiter->recordLoginFailure($ip, $email);
+        renderPage('Student App', renderStudentAppLogin('Invalid credentials or inactive account.'));
+        exit;
+    }
+    if ((string) ($user['role'] ?? '') !== 'student') {
+        renderPage(
+            'Student App',
+            renderStudentAppLogin('This app is for student accounts only. Signatories and admins should use the staff web portal.')
+        );
+        exit;
+    }
+    $rateLimiter->clearLoginFailures($email);
+    AuthLayer::login($user);
+    header('Location: ' . app_path('/dashboard'));
+    exit;
+}
+
 if ($path === '/' && $method === 'GET') {
     if (!isset($_SESSION['user'])) {
         header('Location: ' . app_path('/login'));
@@ -120,19 +241,28 @@ if ($path === '/login' && $method === 'GET') {
 if ($path === '/login' && $method === 'POST') {
     $email = trim((string) ($_POST['email'] ?? ''));
     $password = (string) ($_POST['password'] ?? '');
+    $ip = AuthLayer::clientIp();
+    $blocked = $rateLimiter->loginBlocked($ip, $email);
+    if ($blocked !== null) {
+        renderPage('Login', renderLoginForm($blocked, buildLoginStats($service)));
+        exit;
+    }
     $user = $service->authenticate($email, $password);
     if (!$user) {
+        $rateLimiter->recordLoginFailure($ip, $email);
         renderPage('Login', renderLoginForm('Invalid credentials or inactive account.', buildLoginStats($service)));
         exit;
     }
-    $_SESSION['user'] = $user;
+    $rateLimiter->clearLoginFailures($email);
+    AuthLayer::login($user);
     header('Location: ' . app_path('/dashboard'));
     exit;
 }
 
 if ($path === '/logout' && $method === 'POST') {
-    session_destroy();
-    header('Location: ' . app_path('/login'));
+    $logoutRole = (string) ($_SESSION['user']['role'] ?? '');
+    AuthLayer::logout();
+    header('Location: ' . app_path($logoutRole === 'student' ? '/app' : '/login'));
     exit;
 }
 
@@ -147,6 +277,13 @@ if ($path === '/forgot-password' && $method === 'POST') {
         renderPage('Forgot Password', renderForgotPasswordForm('Please enter your account email.', $email));
         exit;
     }
+    $ip = AuthLayer::clientIp();
+    $blocked = $rateLimiter->forgotPasswordBlocked($ip, $email);
+    if ($blocked !== null) {
+        renderPage('Forgot Password', renderForgotPasswordForm($blocked, $email));
+        exit;
+    }
+    $rateLimiter->recordForgotPassword($ip, $email);
     $token = $service->createPasswordResetToken($email, 30);
     $debugResetUrl = null;
     $emailNotice = null;
@@ -154,8 +291,11 @@ if ($path === '/forgot-password' && $method === 'POST') {
         $resetUrl = buildAppUrl('/reset-password?token=' . urlencode($token));
         $mailSent = sendPasswordResetEmail($email, $resetUrl);
         if (!$mailSent) {
-            $debugResetUrl = $resetUrl;
-            $emailNotice = 'Email is not configured or failed to send. Use the reset link below for now.';
+            error_log('Password reset email could not be sent.');
+            if (AuthLayer::allowsAuthDebugOutput()) {
+                $debugResetUrl = $resetUrl;
+                $emailNotice = 'Email is not configured or failed to send. Use the reset link below for local testing only.';
+            }
         }
     }
     renderPage(
@@ -181,17 +321,26 @@ if ($path === '/reset-password' && $method === 'POST') {
     $token = trim((string) ($_POST['token'] ?? ''));
     $newPassword = trim((string) ($_POST['new_password'] ?? ''));
     $confirmPassword = trim((string) ($_POST['confirm_password'] ?? ''));
+    $ip = AuthLayer::clientIp();
+    $blocked = $rateLimiter->resetPasswordBlocked($ip);
+    if ($blocked !== null) {
+        renderPage('Reset Password', renderResetPasswordForm($token, $blocked, null));
+        exit;
+    }
 
     if ($newPassword === '' || $confirmPassword === '') {
+        $rateLimiter->recordResetPasswordFailure($ip);
         renderPage('Reset Password', renderResetPasswordForm($token, 'Please complete all password fields.', null));
         exit;
     }
     if ($newPassword !== $confirmPassword) {
+        $rateLimiter->recordResetPasswordFailure($ip);
         renderPage('Reset Password', renderResetPasswordForm($token, 'New password and confirm password do not match.', null));
         exit;
     }
     $result = $service->resetPasswordByToken($token, $newPassword);
     if (!($result['ok'] ?? false)) {
+        $rateLimiter->recordResetPasswordFailure($ip);
         renderPage('Reset Password', renderResetPasswordForm($token, (string) ($result['message'] ?? 'Unable to reset password.'), null));
         exit;
     }
@@ -217,7 +366,7 @@ if ($semester !== null) {
     $service->processDailyDeadlineNotifications((int) $semester['id']);
 }
 $user = $service->enrichUserForHeader($user, $semester ? (int) $semester['id'] : null);
-$_SESSION['user'] = $user;
+AuthLayer::refreshUser($user);
 
 if ($user['role'] === 'admin') {
     $settingsSemester = $semester ?? ['academic_year' => 'N/A', 'term' => 'N/A'];
@@ -305,8 +454,10 @@ if (
     $storageRoot = realpath(dirname(__DIR__) . '/storage');
     $targetPath = realpath(dirname(__DIR__) . '/' . $relativeStoragePath);
 
+    $canReadStoredFile = $service->userCanAccessStoredFile($user, $relativeStoragePath, $semesterId);
     if (
-        $storageRoot === false
+        !$canReadStoredFile
+        || $storageRoot === false
         || $targetPath === false
         || !str_starts_with($targetPath, $storageRoot . DIRECTORY_SEPARATOR)
         || !is_file($targetPath)
@@ -357,11 +508,13 @@ if ($path === '/dashboard' && $method === 'GET') {
         $filterProgram = 0;
         $filterYearLevel = '';
         $filterSearchName = '';
+        $filterSearchStatus = '';
         if ($allowQueueCollegeProgram) {
             $filterCollege = isset($_GET['college_id']) ? (int) $_GET['college_id'] : 0;
             $filterProgram = isset($_GET['program_id']) ? (int) $_GET['program_id'] : 0;
             $filterYearLevel = trim((string) ($_GET['year_level'] ?? ''));
             $filterSearchName = trim((string) ($_GET['search_name'] ?? ''));
+            $filterSearchStatus = signatoryQueueStatusFilterValue((string) ($_GET['search_status'] ?? ''));
             if ($requiredCollegeId !== null) {
                 $filterCollege = $requiredCollegeId;
             }
@@ -372,7 +525,8 @@ if ($path === '/dashboard' && $method === 'GET') {
             $filterCollege > 0 ? $filterCollege : null,
             $filterProgram > 0 ? $filterProgram : null,
             $filterYearLevel !== '' ? $filterYearLevel : null,
-            $filterSearchName !== '' ? $filterSearchName : null
+            $filterSearchName !== '' ? $filterSearchName : null,
+            $filterSearchStatus !== '' ? $filterSearchStatus : null
         );
         $queueCollegeProgramFilter = null;
         if ($allowQueueCollegeProgram) {
@@ -390,6 +544,7 @@ if ($path === '/dashboard' && $method === 'GET') {
                 'program_id' => $filterProgram,
                 'year_level' => $filterYearLevel,
                 'search_name' => $filterSearchName,
+                'search_status' => $filterSearchStatus,
                 'colleges' => $colleges,
                 'programs_by_college' => $programsByCollege,
                 'premium_layout' => $service->signatoryOfficeUsesPremiumQueueDashboard($office),
@@ -497,6 +652,11 @@ if ($path === '/student/messages' && $method === 'GET' && $user['role'] === 'stu
     exit;
 }
 
+if ($path === '/student/account' && $method === 'GET' && $user['role'] === 'student') {
+    renderPage('My Account', renderStudentAccountPage($user, $semester));
+    exit;
+}
+
 if ($path === '/student/deadline-countdown' && $method === 'GET' && $user['role'] === 'student') {
     $deadlineStatus = $service->getSemesterDeadlineStatus($semester);
     renderPage(
@@ -516,11 +676,13 @@ if ($path === '/signatory/messages' && $method === 'GET' && $user['role'] === 's
     $returnProgram = 0;
     $returnYearLevel = '';
     $returnSearchName = '';
+    $returnSearchStatus = '';
     if ($allowQueueCollegeProgram) {
         $returnCollege = isset($_GET['college_id']) ? (int) $_GET['college_id'] : 0;
         $returnProgram = isset($_GET['program_id']) ? (int) $_GET['program_id'] : 0;
         $returnYearLevel = trim((string) ($_GET['year_level'] ?? ''));
         $returnSearchName = trim((string) ($_GET['search_name'] ?? ''));
+        $returnSearchStatus = signatoryQueueStatusFilterValue((string) ($_GET['search_status'] ?? ''));
         if ($requiredCollegeId !== null) {
             $returnCollege = $requiredCollegeId;
         }
@@ -551,6 +713,7 @@ if ($path === '/signatory/messages' && $method === 'GET' && $user['role'] === 's
             $returnProgram,
             $returnYearLevel,
             $returnSearchName,
+            $returnSearchStatus,
             $allowQueueCollegeProgram,
             (int) $user['id']
         )
@@ -683,8 +846,7 @@ if ($path === '/student/final-clearance' && $method === 'GET' && $user['role'] =
     $useDompdf = class_exists('\Dompdf\Dompdf');
     $html = renderFinalClearanceDocument($clearance, $useDompdf, finalClearanceSignatureOfficeCodes());
     if ($useDompdf) {
-        $dompdfClass = '\Dompdf\Dompdf';
-        $dompdf = new $dompdfClass(['isRemoteEnabled' => true]);
+        $dompdf = createClearanceDompdf();
         $dompdf->loadHtml($html);
         $dompdf->setPaper('A4', 'portrait');
         $dompdf->render();
@@ -719,8 +881,7 @@ if ($path === '/admin/final-clearance' && $method === 'GET' && $user['role'] ===
     $useDompdf = class_exists('\Dompdf\Dompdf');
     $html = renderFinalClearanceDocument($clearance, $useDompdf, finalClearanceSignatureOfficeCodes());
     if ($useDompdf) {
-        $dompdfClass = '\Dompdf\Dompdf';
-        $dompdf = new $dompdfClass(['isRemoteEnabled' => true]);
+        $dompdf = createClearanceDompdf();
         $dompdf->loadHtml($html);
         $dompdf->setPaper('A4', 'portrait');
         $dompdf->render();
@@ -1166,6 +1327,7 @@ if ($path === '/admin/student/update' && $method === 'POST' && $user['role'] ===
         (string) ($_POST['student_account_type'] ?? ''),
         (string) ($_POST['student_org_position'] ?? ''),
         (string) ($_POST['student_staying'] ?? ''),
+        (string) ($_POST['campus'] ?? ''),
         $newPw !== '' ? $newPw : null
     );
     $_SESSION['flash'] = $result['message'];
@@ -1235,6 +1397,7 @@ if ($path === '/admin/register-students' && $method === 'POST' && $user['role'] 
         'student_account_type' => trim((string) ($_POST['student_account_type'] ?? '')),
         'student_org_position' => trim((string) ($_POST['student_org_position'] ?? '')),
         'student_staying' => trim((string) ($_POST['student_staying'] ?? '')),
+        'campus' => trim((string) ($_POST['campus'] ?? '')),
     ];
     $result = $service->registerStudentWithCollegeProgram(
         $posted['student_no'],
@@ -1247,7 +1410,8 @@ if ($path === '/admin/register-students' && $method === 'POST' && $user['role'] 
         $posted['year_level'],
         $posted['student_account_type'],
         $posted['student_org_position'],
-        $posted['student_staying']
+        $posted['student_staying'],
+        $posted['campus']
     );
     if ($result['ok']) {
         $_SESSION['flash'] = $result['message'];
@@ -1265,12 +1429,59 @@ if ($path === '/admin/register-students' && $method === 'POST' && $user['role'] 
     exit;
 }
 
+if ($path === '/admin/pending-departments' && $method === 'GET' && $user['role'] === 'admin') {
+    $officeId = isset($_GET['office_id']) ? (int) $_GET['office_id'] : 0;
+    $campusFilter = isset($_GET['campus']) ? trim((string) $_GET['campus']) : '';
+    $collegeId = isset($_GET['college_id']) ? (int) $_GET['college_id'] : 0;
+    $programId = isset($_GET['program_id']) ? (int) $_GET['program_id'] : 0;
+    $yearLevel = trim((string) ($_GET['year_level'] ?? ''));
+    $searchName = trim((string) ($_GET['search_name'] ?? ''));
+    $officeStatus = strtolower(trim((string) ($_GET['office_status'] ?? '')));
+    $export = isset($_GET['export']) ? (string) $_GET['export'] : '';
+    $filters = [
+        'office_id' => $officeId,
+        'campus' => $campusFilter,
+        'college_id' => $collegeId,
+        'program_id' => $programId,
+        'year_level' => $yearLevel,
+        'search_name' => $searchName,
+        'office_status' => $officeStatus,
+    ];
+    $monitor = $service->getAdminPendingDepartmentMonitor(
+        $semesterId,
+        $officeId > 0 ? $officeId : null,
+        $campusFilter !== '' ? $campusFilter : null,
+        $collegeId > 0 ? $collegeId : null,
+        $programId > 0 ? $programId : null,
+        $yearLevel !== '' ? $yearLevel : null,
+        $searchName !== '' ? $searchName : null,
+        $officeStatus !== '' ? $officeStatus : null
+    );
+    if ($export === 'csv') {
+        downloadAdminPendingDepartmentsCsv($monitor['students'], $semester);
+        exit;
+    }
+    renderPage(
+        'Pending Departments',
+        renderAdminPendingDepartments(
+            $semester,
+            $monitor,
+            $filters,
+            $service->listActiveColleges(),
+            $service->programsGroupedByCollegeId()
+        )
+    );
+    exit;
+}
+
 if ($path === '/admin/reports' && $method === 'GET' && $user['role'] === 'admin') {
     $overallStatus = isset($_GET['overall_status']) ? (string) $_GET['overall_status'] : '';
+    $campusFilter = isset($_GET['campus']) ? trim((string) $_GET['campus']) : '';
     $export = isset($_GET['export']) ? (string) $_GET['export'] : '';
     $reportRows = $service->getAdminClearanceReport(
         $semesterId,
-        $overallStatus !== '' ? $overallStatus : null
+        $overallStatus !== '' ? $overallStatus : null,
+        $campusFilter !== '' ? $campusFilter : null
     );
     if ($export === 'csv') {
         downloadAdminReportCsv($reportRows, $semester);
@@ -1280,6 +1491,7 @@ if ($path === '/admin/reports' && $method === 'GET' && $user['role'] === 'admin'
         'Admin Clearance Reports',
         renderAdminReports($semester, $reportRows, [
             'overall_status' => $overallStatus,
+            'campus' => $campusFilter,
         ])
     );
     exit;
@@ -1288,6 +1500,11 @@ if ($path === '/admin/reports' && $method === 'GET' && $user['role'] === 'admin'
 if ($method === 'GET' && preg_match('#^/students/(\d+)/clearance$#', $path, $matches) === 1) {
     $studentId = (int) $matches[1];
     $targetSemesterId = isset($_GET['semester_id']) ? (int) $_GET['semester_id'] : $semesterId;
+    if (!$service->actorCanViewStudentClearance((int) $user['id'], (string) $user['role'], $studentId, $targetSemesterId)) {
+        http_response_code(403);
+        json(['ok' => false, 'error' => 'Forbidden.']);
+        exit;
+    }
     json(['data' => $service->getStudentClearanceOverview($studentId, $targetSemesterId)]);
     exit;
 }
@@ -1295,14 +1512,22 @@ if ($method === 'GET' && preg_match('#^/students/(\d+)/clearance$#', $path, $mat
 if ($method === 'POST' && preg_match('#^/offices/(\d+)/students/(\d+)/decision$#', $path, $matches) === 1) {
     $officeId = (int) $matches[1];
     $studentId = (int) $matches[2];
+    if ((string) ($user['role'] ?? '') !== 'signatory') {
+        http_response_code(403);
+        json(['ok' => false, 'error' => 'Forbidden.']);
+        exit;
+    }
     $rawBody = file_get_contents('php://input');
     $payload = json_decode($rawBody ?: '{}', true);
+    if (!is_array($payload)) {
+        $payload = [];
+    }
     json($service->decideOfficeClearance(
         $officeId,
         $studentId,
         (int) ($payload['semester_id'] ?? $semesterId),
         (string) ($payload['status'] ?? 'pending'),
-        (int) ($payload['signatory_id'] ?? 0),
+        (int) $user['id'],
         isset($payload['reason']) ? (string) $payload['reason'] : null
     ));
     exit;
@@ -1315,6 +1540,31 @@ function json(array $payload): void
 {
     header('Content-Type: application/json');
     echo json_encode($payload);
+}
+
+function isJsonApiPath(string $path): bool
+{
+    return preg_match('#^/students/\d+/clearance$#', $path) === 1
+        || preg_match('#^/offices/\d+/students/\d+/decision$#', $path) === 1;
+}
+
+function requestWantsJson(): bool
+{
+    $accept = (string) ($_SERVER['HTTP_ACCEPT'] ?? '');
+    $contentType = (string) ($_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? '');
+
+    return str_contains($accept, 'application/json') || str_contains($contentType, 'application/json');
+}
+
+function createClearanceDompdf(): \Dompdf\Dompdf
+{
+    $root = dirname(__DIR__);
+    $dompdfClass = '\Dompdf\Dompdf';
+
+    return new $dompdfClass([
+        'isRemoteEnabled' => false,
+        'chroot' => [$root],
+    ]);
 }
 
 function buildAppUrl(string $path): string
@@ -1346,11 +1596,80 @@ function formatYearLevelCell(mixed $yearLevel): string
 }
 
 /** @return array<string,string> */
+function studentCampusOptions(): array
+{
+    return ClearanceService::campusOptions();
+}
+
+function formatStudentCampusCell(mixed $campus): string
+{
+    $label = ClearanceService::campusDisplayLabel(trim((string) ($campus ?? '')));
+
+    return $label !== '' ? htmlspecialchars($label) : '—';
+}
+
+function renderStudentCampusSelect(string $name, string $selectedRaw, bool $required, bool $includeAllOption = false): string
+{
+    $sel = trim($selectedRaw);
+    $reqAttr = $required ? ' required' : '';
+    $html = '<select class="form-select" name="' . htmlspecialchars($name) . '"' . $reqAttr . '>';
+    if ($includeAllOption) {
+        $html .= '<option value=""' . ($sel === '' ? ' selected' : '') . '>All campuses</option>';
+    } else {
+        $html .= '<option value=""' . ($sel === '' ? ' selected' : '') . '>Select campus</option>';
+    }
+    foreach (studentCampusOptions() as $val => $label) {
+        $isSel = $sel === $val ? ' selected' : '';
+        $html .= '<option value="' . htmlspecialchars($val) . '"' . $isSel . '>' . htmlspecialchars($label) . '</option>';
+    }
+    $html .= '</select>';
+
+    return $html;
+}
+
+/** @return array<string,string> */
+function signatoryQueueStatusFilterOptions(): array
+{
+    return [
+        '' => 'All statuses',
+        'for_review' => 'For Review',
+        'cleared' => 'Approved',
+        'rejected' => 'Disapproved',
+    ];
+}
+
+function signatoryQueueStatusFilterValue(string $raw): string
+{
+    $v = strtolower(trim($raw));
+    if ($v === 'approved') {
+        return 'cleared';
+    }
+    if ($v === 'disapproved') {
+        return 'rejected';
+    }
+
+    return in_array($v, ['for_review', 'cleared', 'rejected'], true) ? $v : '';
+}
+
+function renderSignatoryQueueStatusFilterOptionsHtml(string $selected): string
+{
+    $html = '';
+    foreach (signatoryQueueStatusFilterOptions() as $val => $label) {
+        $sel = $selected === (string) $val ? ' selected' : '';
+        $html .= '<option value="' . htmlspecialchars((string) $val, ENT_QUOTES, 'UTF-8') . '"' . $sel . '>'
+            . htmlspecialchars($label) . '</option>';
+    }
+
+    return $html;
+}
+
+/** @return array<string,string> */
 function signatoryQueueFilterQuery(
     int $collegeId = 0,
     int $programId = 0,
     string $yearLevel = '',
-    string $searchName = ''
+    string $searchName = '',
+    string $searchStatus = ''
 ): array {
     $q = [];
     if ($collegeId > 0) {
@@ -1367,6 +1686,10 @@ function signatoryQueueFilterQuery(
     if ($name !== '') {
         $q['search_name'] = $name;
     }
+    $status = signatoryQueueStatusFilterValue($searchStatus);
+    if ($status !== '') {
+        $q['search_status'] = $status;
+    }
 
     return $q;
 }
@@ -1375,9 +1698,10 @@ function signatoryQueueFilterQueryString(
     int $collegeId = 0,
     int $programId = 0,
     string $yearLevel = '',
-    string $searchName = ''
+    string $searchName = '',
+    string $searchStatus = ''
 ): string {
-    $q = signatoryQueueFilterQuery($collegeId, $programId, $yearLevel, $searchName);
+    $q = signatoryQueueFilterQuery($collegeId, $programId, $yearLevel, $searchName, $searchStatus);
 
     return $q === [] ? '' : '?' . http_build_query($q);
 }
@@ -1392,7 +1716,8 @@ function signatoryQueueFilterQueryFromPost(array $post, bool $useCollegeFieldNam
         (int) ($post[$collegeKey] ?? 0),
         (int) ($post[$programKey] ?? 0),
         trim((string) ($post['return_year_level'] ?? '')),
-        trim((string) ($post['return_search_name'] ?? ''))
+        trim((string) ($post['return_search_name'] ?? '')),
+        trim((string) ($post['return_search_status'] ?? ''))
     );
 }
 
@@ -1400,12 +1725,14 @@ function signatoryQueueReturnFilterHiddenFields(
     int $returnCollege,
     int $returnProgram,
     string $returnYearLevel,
-    string $returnSearchName = ''
+    string $returnSearchName = '',
+    string $returnSearchStatus = ''
 ): string {
     $html = '<input type="hidden" name="return_college_id" value="' . $returnCollege . '">';
     $html .= '<input type="hidden" name="return_program_id" value="' . $returnProgram . '">';
     $html .= '<input type="hidden" name="return_year_level" value="' . htmlspecialchars($returnYearLevel, ENT_QUOTES, 'UTF-8') . '">';
     $html .= '<input type="hidden" name="return_search_name" value="' . htmlspecialchars($returnSearchName, ENT_QUOTES, 'UTF-8') . '">';
+    $html .= '<input type="hidden" name="return_search_status" value="' . htmlspecialchars(signatoryQueueStatusFilterValue($returnSearchStatus), ENT_QUOTES, 'UTF-8') . '">';
 
     return $html;
 }
@@ -1421,7 +1748,8 @@ function renderSignatoryQueueSearchFiltersForm(
     int $returnProgram,
     string $returnYearLevel,
     bool $lockCollege = false,
-    string $returnSearchName = ''
+    string $returnSearchName = '',
+    string $returnSearchStatus = ''
 ): string {
     $programsJson = json_encode($programsByCollege, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE);
     if ($programsJson === false) {
@@ -1467,6 +1795,10 @@ function renderSignatoryQueueSearchFiltersForm(
         $sel = $returnYearLevel === (string) $val ? ' selected' : '';
         $html .= '<option value="' . htmlspecialchars((string) $val) . '"' . $sel . '>' . htmlspecialchars((string) $label) . '</option>';
     }
+    $html .= '</select></div>';
+    $html .= '<div class="col-md-2"><label class="form-label small text-muted mb-1">Status</label>';
+    $html .= '<select name="search_status" class="form-select form-select-sm">';
+    $html .= renderSignatoryQueueStatusFilterOptionsHtml($returnSearchStatus);
     $html .= '</select></div>';
     $html .= '<div class="col-md-3 d-flex gap-2">';
     $html .= '<button class="btn btn-sm btn-primary" type="submit"><i class="fas fa-search me-1"></i>Apply</button>';
@@ -1615,23 +1947,200 @@ function renderStudentStayingSelect(string $name, string $selectedRaw, bool $req
     return $html;
 }
 
+function renderStudentPwaHead(): string
+{
+    $html = '<link rel="manifest" href="' . hpath('/manifest.webmanifest') . '">';
+    $html .= '<meta name="theme-color" content="#0f3b4f">';
+    $html .= '<meta name="mobile-web-app-capable" content="yes">';
+    $html .= '<meta name="apple-mobile-web-app-capable" content="yes">';
+    $html .= '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">';
+    $html .= '<meta name="apple-mobile-web-app-title" content="SAFE Student">';
+    $html .= '<link rel="apple-touch-icon" href="' . hpath('/app/icon/192') . '">';
+    $html .= '<link rel="icon" type="image/png" sizes="192x192" href="' . hpath('/app/icon/192') . '">';
+    $html .= '<link rel="stylesheet" href="' . hasset('student-app.css') . '">';
+
+    return $html;
+}
+
+function renderStudentPwaScripts(): string
+{
+    global $appBasePath;
+    $config = json_encode([
+        'swUrl' => app_path('/sw.js'),
+        'scope' => StudentPwa::scope((string) $appBasePath),
+    ], JSON_UNESCAPED_SLASHES);
+
+    return '<script>window.STUDENT_PWA = ' . $config . ';</script>'
+        . '<script src="' . hasset('student-app.js') . '" defer></script>';
+}
+
+function studentAppNavKey(string $requestPath): string
+{
+    if (str_starts_with($requestPath, '/student/messages')) {
+        return 'messages';
+    }
+    if (str_starts_with($requestPath, '/student/account')) {
+        return 'account';
+    }
+
+    return 'home';
+}
+
+function renderStudentAppNav(string $requestPath, int $unread, string $placement): string
+{
+    $active = studentAppNavKey($requestPath);
+    $items = [
+        ['key' => 'home', 'href' => '/dashboard', 'icon' => 'fa-home', 'label' => 'Home'],
+        ['key' => 'messages', 'href' => '/student/messages', 'icon' => 'fa-comments', 'label' => 'Messages'],
+        ['key' => 'account', 'href' => '/student/account', 'icon' => 'fa-user', 'label' => 'Account'],
+    ];
+    $class = $placement === 'side' ? 'sapp-sidenav' : 'sapp-tabbar';
+    $html = '<nav class="' . $class . '" aria-label="Student app">';
+    foreach ($items as $item) {
+        $isActive = $active === $item['key'];
+        $html .= '<a class="sapp-tab' . ($isActive ? ' is-active' : '') . '" href="' . hpath($item['href']) . '">';
+        $html .= '<i class="fas ' . $item['icon'] . '" aria-hidden="true"></i>';
+        $html .= '<span>' . htmlspecialchars($item['label']) . '</span>';
+        if ($item['key'] === 'messages' && $unread > 0) {
+            $html .= '<span class="sapp-badge">' . (int) $unread . '</span>';
+        }
+        $html .= '</a>';
+    }
+    if ($placement === 'side') {
+        $html .= '<form method="POST" action="' . hpath('/logout') . '" class="mt-auto mb-0 px-1">';
+        $html .= '<button class="btn btn-outline-secondary w-100" type="submit">Logout</button></form>';
+    }
+    $html .= '</nav>';
+
+    return $html;
+}
+
+function renderStudentAppTopbar(array $user): string
+{
+    $name = trim((string) ($user['display_account_name'] ?? ''));
+    if ($name === '') {
+        $name = trim((string) ($user['first_name'] ?? '') . ' ' . (string) ($user['last_name'] ?? ''));
+    }
+    if ($name === '') {
+        $name = 'Student';
+    }
+
+    $html = '<header class="sapp-topbar">';
+    $html .= '<div class="sapp-brand"><span class="sapp-brand-mark"><img src="' . hasset('wpu-logo.png') . '" alt="Western Philippines University"></span>';
+    $html .= '<div class="sapp-brand-text"><strong>SAFE Student</strong><span>' . htmlspecialchars($name) . '</span></div></div>';
+    $html .= '<button type="button" class="sapp-install-btn" data-sapp-install><i class="fas fa-download" aria-hidden="true"></i> Install app</button>';
+    $html .= '</header>';
+
+    return $html;
+}
+
+function renderStudentAppInstallBanner(): string
+{
+    return '<div class="sapp-install-banner" data-sapp-install-banner>'
+        . '<div><strong>Install SAFE Student</strong>'
+        . '<p>Use it like an app on this computer or add it to your phone home screen.</p>'
+        . '<div class="sapp-ios-help" data-sapp-ios-help hidden>'
+        . '<ol><li>Tap the Share button in Safari.</li><li>Choose <strong>Add to Home Screen</strong>.</li><li>Open the new SAFE Student icon.</li></ol>'
+        . '</div></div>'
+        . '<button type="button" class="btn btn-sm btn-success" data-sapp-install>Install</button>'
+        . '</div>';
+}
+
+function renderStudentAppLogin(?string $error): string
+{
+    $safeError = htmlspecialchars((string) ($error ?? ''), ENT_QUOTES, 'UTF-8');
+    $errorClass = $error ? ' show' : '';
+
+    return '<div class="sapp-login">
+    <div class="sapp-login-hero">
+        <div class="sapp-login-brand">
+            <span class="sapp-brand-mark"><img src="' . hasset('wpu-logo.png') . '" alt="Western Philippines University"></span>
+            <h1>SAFE Student</h1>
+        </div>
+        <p>Track your clearance, upload requirements, and message offices.</p>
+    </div>
+    <div class="sapp-only-note"><i class="fas fa-user-graduate" aria-hidden="true"></i><span>Student accounts only. This app can be used in a browser or installed on your phone.</span></div>
+    <div id="errorBox" class="error-message' . $errorClass . '">
+        <i class="fas fa-exclamation-triangle"></i>
+        <span id="errorText">' . ($safeError !== '' ? $safeError : 'Invalid credentials or inactive account.') . '</span>
+    </div>
+    <form method="POST" action="' . hpath('/app') . '">
+        ' . csrf_field() . '
+        <div class="input-group">
+            <label class="input-label"><i class="fas fa-envelope"></i><span>Student email</span></label>
+            <input type="email" name="email" class="input-field" placeholder="student@wpu.edu.ph" required>
+        </div>
+        <div class="input-group">
+            <label class="input-label"><i class="fas fa-lock"></i><span>Password</span></label>
+            <input type="password" name="password" class="input-field" placeholder="••••••••" required>
+        </div>
+        <div class="forgot-link"><a href="' . hpath('/forgot-password') . '?from=app">Forgot password?</a></div>
+        <button type="submit" class="signin-btn"><i class="fas fa-arrow-right-to-bracket"></i> Sign in</button>
+    </form>
+    ' . renderStudentAppInstallBanner() . '
+    <a class="sapp-staff-link" href="' . hpath('/login') . '">Signatory or admin? Open the staff portal</a>
+</div>';
+}
+
+function renderStudentAppStaffBlocked(array $user): string
+{
+    $role = htmlspecialchars((string) ($user['role'] ?? 'staff'));
+
+    return '<div class="sapp-login">'
+        . '<div class="sapp-login-hero"><div class="sapp-login-brand"><span class="sapp-brand-mark"><img src="' . hasset('wpu-logo.png') . '" alt="Western Philippines University"></span>'
+        . '<h1>Student app only</h1></div><p>This installable app is limited to student accounts.</p></div>'
+        . '<div class="sapp-only-note"><i class="fas fa-ban" aria-hidden="true"></i><span>You are signed in as <strong>' . $role . '</strong>. Use the staff web portal instead.</span></div>'
+        . '<a class="signin-btn" href="' . hpath('/dashboard') . '" style="text-decoration:none;">Open staff portal</a>'
+        . '<form method="POST" action="' . hpath('/logout') . '" class="mt-3 mb-0">'
+        . '<button class="btn btn-outline-secondary w-100" type="submit">Logout</button></form>'
+        . '</div>';
+}
+
+function renderStudentAccountPage(array $user, array $semester): string
+{
+    $email = htmlspecialchars((string) ($user['email'] ?? ''));
+    $dept = htmlspecialchars((string) ($user['display_department'] ?? '—'));
+    $semesterLabel = htmlspecialchars((string) (($semester['academic_year'] ?? '') . ' ' . ($semester['term'] ?? '')));
+    $html = '<h4 class="section-title">My Account</h4>';
+    $html .= '<p class="muted-caption">Install this student app on your computer or phone. Staff accounts cannot sign in here.</p>';
+    $html .= renderStudentAccountSummaryCard($user);
+    $html .= '<div class="card mb-3"><div class="card-body">';
+    $html .= '<div class="row g-3">';
+    $html .= '<div class="col-12 col-md-4"><div class="account-field-label text-muted small text-uppercase fw-semibold">Email</div><div>' . $email . '</div></div>';
+    $html .= '<div class="col-12 col-md-5"><div class="account-field-label text-muted small text-uppercase fw-semibold">Program / college</div><div>' . $dept . '</div></div>';
+    $html .= '<div class="col-12 col-md-3"><div class="account-field-label text-muted small text-uppercase fw-semibold">Semester</div><div>' . $semesterLabel . '</div></div>';
+    $html .= '</div></div></div>';
+    $html .= '<div class="card mb-3"><div class="card-body">';
+    $html .= '<strong>Install on this device</strong>';
+    $html .= '<p class="small text-muted mb-2">Desktop: use the Install button in Chrome or Edge. Phone: install from the banner, or on iPhone use Share → Add to Home Screen.</p>';
+    $html .= '<button type="button" class="btn btn-success" data-sapp-install><i class="fas fa-download me-1" aria-hidden="true"></i>Install app</button>';
+    $html .= '</div></div>';
+    $html .= '<form method="POST" action="' . hpath('/logout') . '"><button class="btn btn-outline-danger" type="submit">Logout</button></form>';
+
+    return $html;
+}
+
 function renderPage(string $title, string $content): void
 {
     $flash = $_SESSION['flash'] ?? null;
     unset($_SESSION['flash']);
     $requestPath = $GLOBALS['_app_request_path'] ?? '/';
+    $isStudentAppAuth = $requestPath === '/app' && !isset($_SESSION['user']);
+    $isStudentAppGate = $requestPath === '/app';
     $isAuthPage = in_array($requestPath, ['/login', '/forgot-password', '/reset-password'], true) && !isset($_SESSION['user']);
     $isStudentPopup = $requestPath === '/student/deadline-countdown';
     $isStudentView = isset($_SESSION['user']) && (string) ($_SESSION['user']['role'] ?? '') === 'student'
         && !$isStudentPopup;
     $isAdminView = isset($_SESSION['user']) && (string) ($_SESSION['user']['role'] ?? '') === 'admin'
         && ($requestPath === '/dashboard' || str_starts_with($requestPath, '/admin/'));
-    echo '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">';
+    $enableStudentPwa = $isStudentView || $isStudentAppAuth || $isStudentAppGate;
+    echo '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">';
     echo '<title>' . htmlspecialchars($title) . '</title>';
-    echo '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">';
+    echo AuthLayer::csrfMeta();
+    echo '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">';
     if ($isAdminView) {
         echo '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">';
-        echo '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">';
+        echo '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" integrity="sha384-5e2ESR8Ycmos6g3gAKr1Jvwye8sW4U1u/cAKulfVJnkakCcMqhOudbtPnvJ+nbv7" crossorigin="anonymous">';
         echo '<style>
         body{margin:0;background:#f1f5f9;font-family:"Inter",sans-serif;color:#0f172a;}
         body.admin-layout{overflow:hidden;height:100vh;}
@@ -1639,6 +2148,8 @@ function renderPage(string $title, string $content): void
         .admin-app{display:flex;height:100vh;overflow:hidden;}
         .admin-sidebar{width:280px;background:linear-gradient(180deg,#0f2b3d 0%,#0a1c2a 100%);color:#e2e8f0;flex-shrink:0;box-shadow:2px 0 12px rgba(0,0,0,.08);height:100vh;overflow-y:auto;overscroll-behavior:contain;}
         .admin-sidebar-header{padding:28px 24px;border-bottom:1px solid #2d4a6e;}
+        .admin-sidebar-brand{display:flex;align-items:center;gap:.75rem;}
+        .admin-sidebar-brand img{width:44px;height:44px;object-fit:contain;border-radius:50%;background:#fff;flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.22);}
         .admin-sidebar-header h2{font-size:1.5rem;font-weight:700;letter-spacing:-.3px;background:linear-gradient(135deg,#fff 0%,#a5f3fc 100%);-webkit-background-clip:text;background-clip:text;color:transparent;margin:0;}
         .admin-sidebar-header p{font-size:.75rem;color:#94a3b8;margin:6px 0 0;}
         .admin-nav{padding:24px 16px;display:flex;flex-direction:column;gap:8px;}
@@ -1662,6 +2173,8 @@ function renderPage(string $title, string $content): void
         .admin-content{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:32px;max-width:1300px;}
         .cards-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:24px;margin-bottom:30px;}
         .stat-card{background:#fff;padding:20px;border-radius:20px;box-shadow:0 1px 3px rgba(0,0,0,.05);border:1px solid #eef2ff;}
+        a.stat-card{color:inherit;}
+        a.stat-card:hover{border-color:#93c5fd;}
         .stat-title{font-size:.85rem;text-transform:uppercase;letter-spacing:.5px;font-weight:600;color:#5b6e8c;margin-bottom:12px;}
         .stat-value{font-size:2rem;font-weight:800;color:#0f2b3d;}
         .student-selector{background:#f8fafc;padding:24px 28px;border-radius:20px;display:flex;flex-wrap:wrap;align-items:flex-end;gap:20px;margin-bottom:28px;border:1px solid #e2edff;}
@@ -1685,12 +2198,25 @@ function renderPage(string $title, string $content): void
         .status-pill{padding:4px 12px;border-radius:40px;font-weight:600;font-size:.74rem;display:inline-block;}
         .status-cleared{background:#e0f2e9;color:#0b5e42;}
         .status-pending{background:#fff1e6;color:#b45309;}
+        .status-for-review{background:#fef9c3;color:#a16207;}
+        .status-rejected{background:#fee2e2;color:#b91c1c;}
+        .dept-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:40px;font-size:.72rem;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;}
+        .dept-chip-pending{background:#fff1e6;color:#b45309;}
+        .dept-chip-for_review{background:#fef9c3;color:#a16207;}
+        .dept-chip-rejected{background:#fee2e2;color:#b91c1c;}
+        .monitor-office-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;margin-bottom:24px;}
+        .monitor-office-card{display:block;background:#fff;padding:16px 18px;border-radius:16px;border:1px solid #e2edff;text-decoration:none;color:inherit;transition:border-color .15s,box-shadow .15s;}
+        .monitor-office-card:hover{border-color:#93c5fd;box-shadow:0 2px 8px rgba(30,74,110,.08);color:inherit;}
+        .monitor-office-card.active{border-color:#1e4a6e;box-shadow:0 0 0 2px rgba(30,74,110,.2);}
+        .monitor-office-name{font-size:.82rem;font-weight:600;color:#334155;margin-bottom:8px;line-height:1.35;}
+        .monitor-office-count{font-size:1.6rem;font-weight:800;color:#0f2b3d;line-height:1;}
+        .monitor-office-meta{font-size:.72rem;color:#64748b;margin-top:6px;}
         .admin-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;}
         </style>';
     } else {
         $loginBackgroundUrl = hasset('login-background.png');
         echo '<link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">';
-        echo '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">';
+        echo '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" integrity="sha384-5e2ESR8Ycmos6g3gAKr1Jvwye8sW4U1u/cAKulfVJnkakCcMqhOudbtPnvJ+nbv7" crossorigin="anonymous">';
         echo '<style>
         :root{--brand:#198754;--brand-dark:#146c43;--bg:#f3f6f8;--text:#1f2a37;--muted:#6b7280;--border:#e5e7eb;}
         body{background:var(--bg);color:var(--text);font-family:"Inter",sans-serif;}
@@ -1737,14 +2263,12 @@ function renderPage(string $title, string $content): void
         .login-brand::after{content:"";position:absolute;bottom:-14%;left:-9%;width:230px;height:230px;background:rgba(255,215,150,.16);border-radius:50%;filter:blur(1px);}
         .brand-top,.stat-grid{position:relative;z-index:1;}
         .safe-logo{display:flex;align-items:center;gap:.8rem;margin-bottom:1.7rem;}
-        .safe-logo i{font-size:2.2rem;filter:drop-shadow(0 2px 6px rgba(0,0,0,.2));}
+        .safe-logo img{width:52px;height:52px;object-fit:contain;border-radius:50%;background:#fff;flex-shrink:0;box-shadow:0 4px 12px rgba(0,0,0,.22);}
         .safe-logo h2{font-size:1.68rem;font-weight:700;letter-spacing:-.3px;margin:0;background:linear-gradient(to right,#fff,#ffe6b0);-webkit-background-clip:text;background-clip:text;color:transparent;}
         .hero-message h1{font-size:2.2rem;font-weight:800;line-height:1.25;margin:0 0 .95rem;letter-spacing:-.4px;}
         .hero-message .highlight{color:#ffd966;border-bottom:3px solid #ffb347;display:inline-block;}
         .hero-message p{margin:0;max-width:85%;font-size:.98rem;line-height:1.5;opacity:.86;}
         .clearance-badge{background:rgba(255,255,255,.15);backdrop-filter:blur(4px);padding:.86rem 1.1rem;border-radius:1.4rem;display:inline-flex;align-items:center;gap:10px;width:fit-content;margin-top:1.55rem;font-weight:500;font-size:.86rem;border:1px solid rgba(255,255,255,.2);}
-        .logo-wrap{display:flex;justify-content:center;align-items:center;background:rgba(255,255,255,.16);padding:.8rem;border-radius:16px;border:1px solid rgba(255,255,255,.25);margin-top:1.2rem;max-width:220px;}
-        .logo-wrap img{width:100%;height:auto;display:block;background:#fff;border-radius:50%;clip-path:circle(49% at 50% 50%);filter:drop-shadow(0 8px 12px rgba(0,0,0,.15));}
         .stat-grid{display:flex;gap:1.65rem;margin-top:1.7rem;}
         .stat-item{display:flex;flex-direction:column;}
         .stat-number{font-size:1.7rem;font-weight:800;letter-spacing:-.4px;line-height:1;}
@@ -1849,17 +2373,41 @@ function renderPage(string $title, string $content): void
     .app-toast-close{border:0;background:transparent;color:#cbd5e1;font-size:1.1rem;line-height:1;cursor:pointer;padding:0 2px;}
     .app-toast-close:hover{color:#fff;}
     </style>';
+    if ($enableStudentPwa) {
+        echo renderStudentPwaHead();
+    }
     $bodyClass = match (true) {
+        $isStudentAppAuth || ($isStudentAppGate && !$isStudentView) => 'student-app-auth',
         $isAuthPage => 'login-page',
         $isAdminView => 'admin-layout',
         $isStudentPopup => 'student-popup-page',
-        $isStudentView => 'student-layout',
+        $isStudentView => 'student-layout student-app',
         default => '',
     };
     echo '</head><body' . ($bodyClass !== '' ? ' class="' . $bodyClass . '"' : '') . '>';
-    $mainClass = $isAdminView ? '' : ($isAuthPage ? '' : ($isStudentPopup ? 'student-popup-wrap py-3 px-3' : 'container page-wrap py-4'));
+    $studentUnread = 0;
+    if ($isStudentView) {
+        global $service;
+        $openSemester = $service->getOpenSemester();
+        if ($openSemester !== null) {
+            $studentUnread = $service->getUnreadClearanceMessageCountForStudent(
+                (int) ($_SESSION['user']['id'] ?? 0),
+                (int) $openSemester['id']
+            );
+        }
+        echo renderStudentAppTopbar($_SESSION['user'] ?? []);
+        echo '<div class="sapp-layout">';
+        echo renderStudentAppNav($requestPath, $studentUnread, 'side');
+    }
+    $mainClass = $isAdminView
+        ? ''
+        : ($isAuthPage || $isStudentAppAuth || ($isStudentAppGate && !$isStudentView)
+            ? ''
+            : ($isStudentPopup
+                ? 'student-popup-wrap py-3 px-3'
+                : ($isStudentView ? 'container page-wrap py-4 sapp-main' : 'container page-wrap py-4')));
     echo '<main class="' . $mainClass . '">';
-    if (!$isAdminView && !$isAuthPage && !$isStudentPopup && isset($_SESSION['user'])) {
+    if (!$isAdminView && !$isAuthPage && !$isStudentPopup && !$isStudentView && !$isStudentAppGate && isset($_SESSION['user'])) {
         $su = $_SESSION['user'];
         $accName = htmlspecialchars((string) ($su['display_account_name'] ?? ''));
         if ($accName === '') {
@@ -1869,8 +2417,7 @@ function renderPage(string $title, string $content): void
         if ($dept === '') {
             $dept = '—';
         }
-        $headerClass = ($su['role'] ?? '') === 'student' ? ' student-account-header' : '';
-        echo '<div class="d-flex flex-wrap align-items-center justify-content-end gap-3 mb-3 pb-2 border-bottom' . $headerClass . '">';
+        echo '<div class="d-flex flex-wrap align-items-center justify-content-end gap-3 mb-3 pb-2 border-bottom">';
         echo '<div class="text-end small lh-sm">';
         echo '<div class="fw-semibold">' . $accName . '</div>';
         echo '<div class="text-muted" style="font-size:0.8rem;">' . $dept . '</div>';
@@ -1878,11 +2425,17 @@ function renderPage(string $title, string $content): void
         echo '<form method="POST" action="' . hpath('/logout') . '" class="mb-0"><button class="btn btn-sm btn-outline-secondary" type="submit">Logout</button></form>';
         echo '</div>';
         $role = (string) ($su['role'] ?? '');
-        if (in_array($role, ['student', 'signatory'], true)) {
+        if ($role === 'signatory') {
             global $service;
             $headerNotifications = $service->getNotifications((int) ($su['id'] ?? 0));
             echo renderTopNotificationsBar($headerNotifications);
         }
+    }
+    if ($isStudentView) {
+        echo renderStudentAppInstallBanner();
+        global $service;
+        $headerNotifications = $service->getNotifications((int) ($_SESSION['user']['id'] ?? 0));
+        echo renderTopNotificationsBar($headerNotifications);
     }
     if ($flash) {
         $flashText = (string) $flash;
@@ -1919,10 +2472,19 @@ function renderPage(string $title, string $content): void
         </script>';
     }
     echo renderCapitalizeInputScript();
-    if (!$isAdminView && !$isAuthPage && isset($_SESSION['user'])) {
+    if (!$isAdminView && !$isAuthPage && !$isStudentAppAuth && isset($_SESSION['user'])) {
         echo renderStudentDeadlineCountdownLaunchScript();
     }
-    echo '</main></body></html>';
+    echo '</main>';
+    if ($isStudentView) {
+        echo '</div>';
+        echo renderStudentAppNav($requestPath, $studentUnread, 'tab');
+    }
+    if ($enableStudentPwa) {
+        echo renderStudentPwaScripts();
+    }
+    echo AuthLayer::csrfScript();
+    echo '</body></html>';
 }
 
 function renderCapitalizeInputScript(): string
@@ -2308,7 +2870,7 @@ function renderLoginForm(?string $error, ?array $stats = null): string
     <div class="login-brand">
         <div class="brand-top">
             <div class="safe-logo">
-                <i class="fas fa-university"></i>
+                <img src="' . $wpuLogoSrc . '" alt="Western Philippines University">
                 <h2>SAFE</h2>
             </div>
             <div class="hero-message">
@@ -2319,7 +2881,6 @@ function renderLoginForm(?string $error, ?array $stats = null): string
                     <span>Real-time tracking · Multi-signature · Paperless</span>
                 </div>
             </div>
-            <div class="logo-wrap"><img src="' . $wpuLogoSrc . '" alt="SAFE logo"></div>
         </div>
         <div class="stat-grid">
             <div class="stat-item"><span class="stat-number">' . $activeStudentsStat . '</span><span class="stat-label">Active Students</span></div>
@@ -2340,6 +2901,7 @@ function renderLoginForm(?string $error, ?array $stats = null): string
         </div>
 
         <form id="loginForm" method="POST" action="' . hpath('/login') . '">
+            ' . csrf_field() . '
             <div class="input-group">
                 <label class="input-label"><i class="fas fa-envelope"></i><span>Email address</span></label>
                 <input type="email" id="email" name="email" class="input-field" placeholder="student@wpu.edu.ph" required>
@@ -2359,6 +2921,7 @@ function renderLoginForm(?string $error, ?array $stats = null): string
                 <i class="fas fa-shield-alt"></i>
                 <span>Secure access for authorized users only</span>
             </div>
+            <a class="sapp-staff-link" href="' . hpath('/app') . '" style="margin-top:0;">Students: open the Student App (desktop + phone install)</a>
             <span class="developed-by">Developed by: College of Computing Arts and Sciences</span>
         </div>
     </div>
@@ -2441,6 +3004,9 @@ function renderForgotPasswordForm(
     ?string $emailNotice = null
 ): string
 {
+    $fromApp = ((string) ($_GET['from'] ?? $_POST['from'] ?? '')) === 'app';
+    $backPath = $fromApp ? '/app' : '/login';
+    $formAction = hpath('/forgot-password') . ($fromApp ? '?from=app' : '');
     $safeEmail = htmlspecialchars((string) ($email ?? ''), ENT_QUOTES, 'UTF-8');
     $html = '<div class="auth-helper-shell"><div class="auth-helper-card">';
     $html .= '<h2 class="auth-helper-title">Forgot Password</h2>';
@@ -2454,14 +3020,18 @@ function renderForgotPasswordForm(
     if ($emailNotice) {
         $html .= '<div class="alert alert-warning py-2 px-3 small">' . htmlspecialchars($emailNotice) . '</div>';
     }
-    $html .= '<form method="POST" action="' . hpath('/forgot-password') . '">';
+    $html .= '<form method="POST" action="' . $formAction . '">';
+    $html .= csrf_field();
+    if ($fromApp) {
+        $html .= '<input type="hidden" name="from" value="app">';
+    }
     $html .= '<div class="mb-3"><label class="form-label">Email address</label><input type="email" name="email" class="form-control" value="' . $safeEmail . '" placeholder="name@wpu.edu.ph" required></div>';
     $html .= '<div class="auth-helper-actions"><button type="submit" class="signin-btn" style="margin-top:0;">Send reset link</button></div>';
     $html .= '</form>';
     if ($debugResetUrl) {
         $html .= '<div class="reset-debug"><strong>Reset link (for local testing):</strong><br><a class="auth-helper-link" href="' . htmlspecialchars($debugResetUrl) . '">' . htmlspecialchars($debugResetUrl) . '</a></div>';
     }
-    $html .= '<div class="mt-3"><a class="auth-helper-link" href="' . hpath('/login') . '"><i class="fas fa-arrow-left me-1"></i>Back to sign in</a></div>';
+    $html .= '<div class="mt-3"><a class="auth-helper-link" href="' . hpath($backPath) . '"><i class="fas fa-arrow-left me-1"></i>Back to sign in</a></div>';
     $html .= '</div></div>';
     return $html;
 }
@@ -2480,6 +3050,7 @@ function renderResetPasswordForm(string $token, ?string $error = null, ?string $
     }
     if ($token !== '' && $success === null) {
         $html .= '<form method="POST" action="' . hpath('/reset-password') . '">';
+        $html .= csrf_field();
         $html .= '<input type="hidden" name="token" value="' . $safeToken . '">';
         $html .= '<div class="mb-3"><label class="form-label">New password</label><input type="password" name="new_password" class="form-control" minlength="8" required></div>';
         $html .= '<div class="mb-3"><label class="form-label">Confirm password</label><input type="password" name="confirm_password" class="form-control" minlength="8" required></div>';
@@ -2601,10 +3172,11 @@ function buildSignatoryClearanceMessagesPanel(
     string $returnYearLevel,
     string $returnSearchName,
     bool $premiumSkin,
-    int $signatoryUserId
+    int $signatoryUserId,
+    string $returnSearchStatus = ''
 ): string {
     $semLabel = htmlspecialchars($semester['academic_year'] . ' ' . $semester['term']);
-    $baseQ = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+    $baseQ = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
     $dashBase = app_path('/dashboard');
     if ($baseQ !== []) {
         $dashBase .= '?' . http_build_query($baseQ);
@@ -2698,6 +3270,7 @@ function buildSignatoryClearanceMessagesPanel(
         $html .= '<input type="hidden" name="return_program" value="' . (int) $returnProgram . '">';
         $html .= '<input type="hidden" name="return_year_level" value="' . htmlspecialchars($returnYearLevel, ENT_QUOTES, 'UTF-8') . '">';
         $html .= '<input type="hidden" name="return_search_name" value="' . htmlspecialchars($returnSearchName, ENT_QUOTES, 'UTF-8') . '">';
+        $html .= '<input type="hidden" name="return_search_status" value="' . htmlspecialchars(signatoryQueueStatusFilterValue($returnSearchStatus), ENT_QUOTES, 'UTF-8') . '">';
         $html .= '<textarea name="body" class="form-control" rows="2" maxlength="4000" placeholder="Reply…" required></textarea>';
         $html .= '<button type="submit" class="btn btn-primary btn-sm mt-2"><i class="fas fa-paper-plane me-1" aria-hidden="true"></i>Send reply</button>';
         $html .= '</form>';
@@ -3393,6 +3966,7 @@ function renderStudentAccountSummaryCard(array $user): string
     $studentNo = trim((string) ($user['student_no'] ?? ''));
     $fields = [
         ['label' => 'Student No.', 'value' => $studentNo !== '' ? htmlspecialchars($studentNo) : '—'],
+        ['label' => 'Campus', 'value' => formatStudentCampusCell($user['campus'] ?? null)],
         ['label' => 'Student account', 'value' => htmlspecialchars(formatStudentAccountTypeCell($user['student_account_type'] ?? null))],
         ['label' => 'Org. position', 'value' => htmlspecialchars(formatStudentOrgPositionCell($user['student_org_position'] ?? null))],
         ['label' => 'Students staying', 'value' => htmlspecialchars(formatStudentStayingCell($user['student_staying'] ?? null))],
@@ -3517,13 +4091,14 @@ function renderSignatoryMessagesPage(
     int $returnProgram,
     string $returnYearLevel,
     string $returnSearchName,
+    string $returnSearchStatus,
     bool $premiumSkin,
     int $signatoryUserId
 ): string {
     $html = '<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">';
     $html .= '<div><h4 class="section-title mb-0">Student Messages</h4>';
     $html .= '<p class="muted-caption mb-0">Semester: ' . htmlspecialchars($semester['academic_year'] . ' ' . $semester['term']) . '</p></div>';
-    $dashHref = app_path('/dashboard') . signatoryQueueFilterQueryString($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+    $dashHref = app_path('/dashboard') . signatoryQueueFilterQueryString($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
     $html .= '<a class="btn btn-sm btn-outline-secondary" href="' . htmlspecialchars($dashHref, ENT_QUOTES, 'UTF-8') . '"><i class="fas fa-arrow-left me-1" aria-hidden="true"></i>Back to Dashboard</a>';
     $html .= '</div>';
     if ($office === null) {
@@ -3541,7 +4116,8 @@ function renderSignatoryMessagesPage(
         $returnYearLevel,
         $returnSearchName,
         $premiumSkin,
-        $signatoryUserId
+        $signatoryUserId,
+        $returnSearchStatus
     );
     return $html;
 }
@@ -3551,9 +4127,10 @@ function renderSignatoryMessagesLaunchCard(
     int $returnProgram = 0,
     string $returnYearLevel = '',
     string $returnSearchName = '',
-    int $unreadCount = 0
+    int $unreadCount = 0,
+    string $returnSearchStatus = ''
 ): string {
-    $q = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+    $q = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
     $href = app_path('/signatory/messages');
     if ($q !== []) {
         $href .= '?' . http_build_query($q);
@@ -3584,7 +4161,8 @@ function renderSignatoryStudentAttachedRequirements(
     int $returnProgram,
     string $returnYearLevel,
     bool $premium = false,
-    string $returnSearchName = ''
+    string $returnSearchName = '',
+    string $returnSearchStatus = ''
 ): string {
     $html = $premium
         ? '<div class="attached-req-block">'
@@ -3622,14 +4200,14 @@ function renderSignatoryStudentAttachedRequirements(
             $html .= '<form method="POST" action="' . hpath('/signatory/student-requirement/toggle') . '" class="d-inline">';
             $html .= '<input type="hidden" name="requirement_id" value="' . $reqId . '">';
             $html .= '<input type="hidden" name="completed" value="' . ($isCompleted ? '0' : '1') . '">';
-            $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+            $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
             $html .= $premium
                 ? '<button class="btn-outline" type="submit">' . ($isCompleted ? 'Undo' : 'Mark Done') . '</button>'
                 : '<button class="btn btn-sm btn-outline-' . ($isCompleted ? 'secondary' : 'success') . '" type="submit">' . ($isCompleted ? 'Undo' : 'Done') . '</button>';
             $html .= '</form>';
             $html .= '<form method="POST" action="' . hpath('/signatory/student-requirement/delete') . '" class="d-inline" onsubmit="return confirm(\'Remove this requirement?\');">';
             $html .= '<input type="hidden" name="requirement_id" value="' . $reqId . '">';
-            $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+            $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
             $html .= $premium
                 ? '<button class="btn-outline" type="submit">Delete</button>'
                 : '<button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>';
@@ -3648,7 +4226,7 @@ function renderSignatoryStudentAttachedRequirements(
         ? '<form method="POST" action="' . hpath('/signatory/student-requirement/add') . '" class="attached-req-add-form" enctype="multipart/form-data">'
         : '<form method="POST" action="' . hpath('/signatory/student-requirement/add') . '" class="mt-1" enctype="multipart/form-data">';
     $html .= '<input type="hidden" name="student_id" value="' . $studentId . '">';
-    $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+    $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
     if ($premium) {
         $html .= '<textarea name="requirements_text" rows="2" placeholder="Add requirement(s), one per line"></textarea>';
         $html .= '<div class="attached-req-upload"><label><i class="fas fa-paperclip"></i> Attachment</label><input type="file" name="attachment"></div>';
@@ -3782,6 +4360,7 @@ function renderSignatoryDashboard(
     $returnProgram = 0;
     $returnYearLevel = '';
     $returnSearchName = '';
+    $returnSearchStatus = '';
     $showCollegeProgramCols = false;
     if ($queueCollegeProgramFilter !== null) {
         $showCollegeProgramCols = true;
@@ -3789,13 +4368,14 @@ function renderSignatoryDashboard(
         $returnProgram = (int) ($queueCollegeProgramFilter['program_id'] ?? 0);
         $returnYearLevel = trim((string) ($queueCollegeProgramFilter['year_level'] ?? ''));
         $returnSearchName = trim((string) ($queueCollegeProgramFilter['search_name'] ?? ''));
+        $returnSearchStatus = signatoryQueueStatusFilterValue((string) ($queueCollegeProgramFilter['search_status'] ?? ''));
     }
 
     $signatoryUnreadCount = 0;
     foreach ($clearanceMessageThreads as $threadRow) {
         $signatoryUnreadCount += (int) ($threadRow['unread_count'] ?? 0);
     }
-    $msgsLaunchHtml = renderSignatoryMessagesLaunchCard($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $signatoryUnreadCount);
+    $msgsLaunchHtml = renderSignatoryMessagesLaunchCard($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $signatoryUnreadCount, $returnSearchStatus);
 
     if ($queueCollegeProgramFilter !== null) {
         return renderSignatoryDashboardPremiumLayout(
@@ -3832,10 +4412,11 @@ function renderSignatoryDashboard(
             $returnProgram,
             $returnYearLevel,
             !empty($queueCollegeProgramFilter['lock_college']),
-            $returnSearchName
+            $returnSearchName,
+            $returnSearchStatus
         );
     }
-    $filterQs = signatoryQueueFilterQueryString($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+    $filterQs = signatoryQueueFilterQueryString($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
     $html .= '<div class="card mb-3"><div class="card-header">Shared Requirements Module</div><div class="card-body">';
     $html .= '<p class="small text-muted mb-2">This is the shared requirements list for this office. All students can see it. You can also assign individual requirements per student in the queue below.</p>';
     $html .= '<form method="POST" action="' . hpath('/signatory/office-requirement/add') . '" enctype="multipart/form-data" class="row g-2 mb-3">';
@@ -3869,7 +4450,7 @@ function renderSignatoryDashboard(
                 $html .= '<div class="col-md-12 d-flex gap-1"><button class="btn btn-sm btn-success">Save</button><a class="btn btn-sm btn-outline-secondary" href="' . hpath('/dashboard') . $filterQs . '">Cancel</a></div>';
                 $html .= '</form>';
             } else {
-                $editQs = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+                $editQs = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
                 $editQs['edit_requirement_id'] = (string) $req['id'];
                 $html .= ' <a class="btn btn-sm btn-outline-success ms-1" href="' . hpath('/dashboard') . '?' . http_build_query($editQs) . '">Edit</a>';
             }
@@ -3897,7 +4478,7 @@ function renderSignatoryDashboard(
     if ($showCollegeProgramCols) {
         $html .= '<th>College</th><th>Program</th>';
     }
-    $html .= '<th>Year</th><th>Status</th><th>Action</th></tr></thead><tbody>';
+    $html .= '<th>Year</th><th>Campus</th><th>Status</th><th>Action</th></tr></thead><tbody>';
     foreach ($queue as $row) {
         $studentId = (int) ($row['student_id'] ?? 0);
         $attachedItems = $studentAttachedRequirementsMap[$studentId] ?? [];
@@ -3929,7 +4510,8 @@ function renderSignatoryDashboard(
             $returnProgram,
             $returnYearLevel,
             false,
-            $returnSearchName
+            $returnSearchName,
+            $returnSearchStatus
         );
         $html .= '</td>';
         if ($showCollegeProgramCols) {
@@ -3939,6 +4521,7 @@ function renderSignatoryDashboard(
             $html .= '<td>' . ($pn !== '' ? htmlspecialchars($pn) : '—') . '</td>';
         }
         $html .= '<td>' . formatYearLevelCell($row['year_level'] ?? null) . '</td>';
+        $html .= '<td>' . formatStudentCampusCell($row['campus'] ?? null) . '</td>';
         $html .= '<td><span class="badge bg-secondary">' . htmlspecialchars(strtoupper((string) $row['clearance_status'])) . '</span></td><td>';
         $subordinateStatuses = $showsGroupSubordinates ? ($groupSubordinateStatusMap[$studentId] ?? []) : [];
         $canApproveGroup = !$showsGroupSubordinates || studentMeetsGroupSubordinateClearanceFromMap($subordinateStatuses);
@@ -3946,7 +4529,7 @@ function renderSignatoryDashboard(
         $html .= '<input type="hidden" name="office_id" value="' . (int) $office['id'] . '">';
         $html .= '<input type="hidden" name="student_id" value="' . (int) $row['student_id'] . '">';
         if ($queueCollegeProgramFilter !== null) {
-            $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+            $html .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
         }
         $html .= '<select name="status" class="form-select form-select-sm"><option value="for_review">For Review</option>';
         $html .= '<option value="cleared"' . ($canApproveGroup ? '' : ' disabled') . '>Cleared</option>';
@@ -4011,7 +4594,8 @@ function renderSignatoryDashboardPremiumLayout(
     $colleges = $queueCollegeProgramFilter['colleges'] ?? [];
     $programsByCollege = $queueCollegeProgramFilter['programs_by_college'] ?? [];
     $lockCollege = !empty($queueCollegeProgramFilter['lock_college']);
-    $filterQs = signatoryQueueFilterQueryString($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+    $returnSearchStatus = signatoryQueueStatusFilterValue((string) ($queueCollegeProgramFilter['search_status'] ?? ''));
+    $filterQs = signatoryQueueFilterQueryString($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
     $programsJson = json_encode($programsByCollege, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE);
     if ($programsJson === false) {
         $programsJson = '{}';
@@ -4066,6 +4650,8 @@ function renderSignatoryDashboardPremiumLayout(
 .signatory-dash-premium .dashboard-container { max-width:1440px; margin:0 auto; padding:0 1.25rem; }
 .signatory-dash-premium .top-bar { display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:1rem; margin-bottom:2rem; }
 .signatory-dash-premium .brand-area h1 { font-size:1.85rem; font-weight:700; background:linear-gradient(135deg,#1e3c72,#2b4c8a); -webkit-background-clip:text; background-clip:text; color:transparent; letter-spacing:-0.3px; margin:0; }
+.signatory-dash-premium .brand-lockup { display:flex; align-items:center; gap:.7rem; }
+.signatory-dash-premium .brand-lockup img { width:44px; height:44px; object-fit:contain; border-radius:50%; background:#fff; flex-shrink:0; box-shadow:0 2px 8px rgba(0,0,0,.12); }
 .signatory-dash-premium .badge-req { font-size:0.8rem; background:#fee2e2; color:#b91c1c; padding:4px 12px; border-radius:40px; display:inline-block; margin-top:8px; font-weight:500; }
 .signatory-dash-premium .office-panel { background:#fff; padding:12px 24px; border-radius:60px; box-shadow:0 4px 12px rgba(0,0,0,0.02); display:flex; gap:1rem; align-items:baseline; flex-wrap:wrap; border:1px solid rgba(0,0,0,0.05); }
 .signatory-dash-premium .office-item { display:flex; align-items:center; gap:10px; font-weight:500; }
@@ -4176,7 +4762,7 @@ CSS;
     $out = '<div class="signatory-dash-premium"><style>' . $css . '</style>';
     $out .= '<div class="dashboard-container">';
     $out .= '<div class="top-bar"><div class="brand-area">';
-    $out .= '<h1><i class="fas fa-check-circle" style="color:#2c6e9e;"></i> SAFE Clearance System</h1>';
+    $out .= '<div class="brand-lockup"><img src="' . hasset('wpu-logo.png') . '" alt="Western Philippines University"><h1>SAFE Clearance System</h1></div>';
     $out .= '</div>';
     $out .= '<div class="office-panel">';
     $out .= '<div class="office-item"><i class="fas fa-building"></i> Office: <strong>' . $officeName . '</strong></div>';
@@ -4202,7 +4788,7 @@ CSS;
     } elseif ($isDeanOffice) {
         $out .= 'Review each student\'s clearance from <strong>units under College Dean / Campus Administrator only</strong> (University/Campus Library and any additional Dean units). The <strong>Student Affairs and Services</strong> group is not shown here. You may approve only after every Dean unit shows <strong>Cleared</strong>. Upload your e-signature before marking a student as <strong>Approved</strong>.';
     } else {
-        $out .= 'All active students are available for review at any time. Use name, college, program, or year level filters to narrow the list.';
+        $out .= 'All active students are available for review at any time. Use name, college, program, year level, or status filters to narrow the list.';
     }
     $out .= '</span></div>';
 
@@ -4245,6 +4831,10 @@ CSS;
         $out .= '<option value="' . htmlspecialchars((string) $val) . '"' . $sel . '>' . htmlspecialchars((string) $label) . '</option>';
     }
     $out .= '</select></div>';
+    $out .= '<div class="filter-group"><label><i class="fas fa-filter"></i> Status</label>';
+    $out .= '<select name="search_status">';
+    $out .= renderSignatoryQueueStatusFilterOptionsHtml($returnSearchStatus);
+    $out .= '</select></div>';
     $out .= '<div class="button-group"><button class="btn-primary" type="submit"><i class="fas fa-search"></i> Apply</button>';
     $out .= '<a class="btn-outline" href="' . hpath('/dashboard') . '"><i class="fas fa-eraser"></i> Reset</a></div>';
     $out .= '</form>';
@@ -4283,7 +4873,7 @@ CSS;
                 $out .= '<a class="btn-outline" href="' . hpath('/dashboard') . $filterQs . '">Cancel</a>';
                 $out .= '</form>';
             } else {
-                $editQs = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+                $editQs = signatoryQueueFilterQuery($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
                 $editQs['edit_requirement_id'] = (string) $req['id'];
                 $out .= '<a class="btn-outline" href="' . hpath('/dashboard') . '?' . http_build_query($editQs) . '">Edit</a>';
             }
@@ -4343,7 +4933,8 @@ CSS;
             $out .= '<div class="student-name">' . $studentLine . ' <span class="student-id">ID: ' . htmlspecialchars((string) $row['student_no']) . '</span></div>';
             $out .= '<div class="college-prog"><span><i class="fas fa-building"></i> ' . ($cn !== '' ? htmlspecialchars($cn) : '—') . '</span>';
             $out .= '<span><i class="fas fa-book-open"></i> ' . ($pn !== '' ? htmlspecialchars($pn) : '—') . '</span>';
-            $out .= '<span><i class="fas fa-layer-group"></i> ' . formatYearLevelCell($row['year_level'] ?? null) . '</span></div>';
+            $out .= '<span><i class="fas fa-layer-group"></i> ' . formatYearLevelCell($row['year_level'] ?? null) . '</span>';
+            $out .= '<span><i class="fas fa-map-marker-alt"></i> ' . formatStudentCampusCell($row['campus'] ?? null) . '</span></div>';
             if ($showsGroupSubordinates && $groupSubordinateLabel !== null) {
                 $subordinateStatuses = $groupSubordinateStatusMap[(int) ($row['student_id'] ?? 0)] ?? [];
                 $out .= renderSignatoryGroupSubordinateStatusChips($subordinateStatuses, $groupSubordinateLabel, true);
@@ -4378,7 +4969,8 @@ CSS;
                 $returnProgram,
                 $returnYearLevel,
                 true,
-                $returnSearchName
+                $returnSearchName,
+                $returnSearchStatus
             );
             $out .= '</div>';
             $subordinateStatuses = $showsGroupSubordinates ? ($groupSubordinateStatusMap[(int) ($row['student_id'] ?? 0)] ?? []) : [];
@@ -4386,7 +4978,7 @@ CSS;
             $out .= '<form method="POST" action="' . hpath('/signatory/decision') . '" class="status-area" style="margin:0;">';
             $out .= '<input type="hidden" name="office_id" value="' . (int) $office['id'] . '">';
             $out .= '<input type="hidden" name="student_id" value="' . (int) $row['student_id'] . '">';
-            $out .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName);
+            $out .= signatoryQueueReturnFilterHiddenFields($returnCollege, $returnProgram, $returnYearLevel, $returnSearchName, $returnSearchStatus);
             $out .= '<div class="status-badge ' . $badgeClass . '"><i class="fas ' . $icon . '"></i> ' . htmlspecialchars($statusLabel) . '</div>';
             $out .= '<select name="status" class="review-select"><option value="for_review"' . $selFor . '>For Review</option>';
             $out .= '<option value="cleared"' . $selClear . ($canApproveGroup ? '' : ' disabled') . '>Approved</option>';
@@ -4437,7 +5029,7 @@ function renderAdminDashboard(array $semester, array $requirements, array $stude
     $inner .= '<div class="cards-grid">';
     $inner .= '<div class="stat-card"><div class="stat-title"><i class="fas fa-users me-1"></i>Total Students</div><div class="stat-value">' . $totalStudents . '</div></div>';
     $inner .= '<div class="stat-card"><div class="stat-title"><i class="fas fa-check-circle me-1"></i>Fully Cleared</div><div class="stat-value">' . $clearedStudents . '</div></div>';
-    $inner .= '<div class="stat-card"><div class="stat-title"><i class="fas fa-hourglass-half me-1"></i>Pending</div><div class="stat-value">' . $pendingStudents . '</div></div>';
+    $inner .= '<a class="stat-card text-decoration-none" href="' . hpath('/admin/pending-departments') . '"><div class="stat-title"><i class="fas fa-hourglass-half me-1"></i>Pending</div><div class="stat-value">' . $pendingStudents . '</div></a>';
     $inner .= '<div class="stat-card"><div class="stat-title"><i class="fas fa-university me-1"></i>Requirements Total</div><div class="stat-value">' . $totalRequirements . '</div></div>';
     $inner .= '</div>';
 
@@ -4445,6 +5037,7 @@ function renderAdminDashboard(array $semester, array $requirements, array $stude
     $inner .= '<span style="display:block;font-size:.75rem;font-weight:600;text-transform:uppercase;color:#4b6b8f;margin-bottom:8px;letter-spacing:.3px;">Admin shortcuts</span>';
     $inner .= '<a class="btn btn-outline-secondary me-2 mb-2" href="' . hpath('/admin/signatories') . '"><i class="fas fa-pen-signature me-1"></i>Add / Assign Signatory</a>';
     $inner .= '<a class="btn btn-outline-secondary me-2 mb-2" href="' . hpath('/admin/register-students') . '"><i class="fas fa-user-plus me-1"></i>Register Students</a>';
+    $inner .= '<a class="btn btn-outline-secondary me-2 mb-2" href="' . hpath('/admin/pending-departments') . '"><i class="fas fa-hourglass-half me-1"></i>Pending Departments</a>';
     $inner .= '<a class="btn btn-outline-secondary mb-2" href="' . hpath('/admin/colleges-programs') . '"><i class="fas fa-school me-1"></i>Colleges &amp; Programs</a>';
     $inner .= '</div>';
 
@@ -4460,13 +5053,16 @@ function renderAdminDashboard(array $semester, array $requirements, array $stude
         $cp = implode(' / ', $parts);
         $yl = trim((string) ($student['year_level'] ?? ''));
         $ylPart = $yl !== '' ? ' · Yr ' . $yl : '';
+        $campusPart = formatStudentCampusCell($student['campus'] ?? null);
+        $campusPart = $campusPart !== '—' ? ' · ' . $campusPart : '';
         $label = sprintf(
-            '%s, %s (%s)%s%s',
+            '%s, %s (%s)%s%s%s',
             (string) $student['last_name'],
             (string) $student['first_name'],
             (string) ($student['student_no'] ?: 'N/A'),
             $cp !== '' ? ' — ' . $cp : '',
-            $ylPart
+            $ylPart,
+            $campusPart
         );
         $inner .= '<option value="' . (int) $student['id'] . '">' . htmlspecialchars($label) . '</option>';
     }
@@ -4487,9 +5083,9 @@ function renderAdminDashboard(array $semester, array $requirements, array $stude
     $inner .= '</div>';
 
     $inner .= '<div class="panel"><div class="panel-header"><h3><i class="fas fa-chart-line"></i>Clearance Reports</h3><a href="' . hpath('/admin/reports') . '" class="text-decoration-none text-secondary"><i class="fas fa-up-right-from-square"></i> Open full report</a></div>';
-    $inner .= '<div style="overflow-x:auto;"><table class="report-table"><thead><tr><th>Student ID</th><th>Name</th><th>College</th><th>Program</th><th>Year</th><th>Email</th><th>Status</th></tr></thead><tbody>';
+    $inner .= '<div style="overflow-x:auto;"><table class="report-table"><thead><tr><th>Student ID</th><th>Name</th><th>Campus</th><th>College</th><th>Program</th><th>Year</th><th>Email</th><th>Status</th></tr></thead><tbody>';
     if ($students === []) {
-        $inner .= '<tr><td colspan="7" class="text-center text-muted">No student records found.</td></tr>';
+        $inner .= '<tr><td colspan="8" class="text-center text-muted">No student records found.</td></tr>';
     } else {
         foreach (array_slice($students, 0, 8) as $row) {
             $status = (string) ($row['overall_status'] ?? 'pending');
@@ -4497,6 +5093,7 @@ function renderAdminDashboard(array $semester, array $requirements, array $stude
             $inner .= '<tr>';
             $inner .= '<td>' . htmlspecialchars((string) ($row['student_no'] ?: 'N/A')) . '</td>';
             $inner .= '<td>' . htmlspecialchars((string) ($row['last_name'] . ', ' . $row['first_name'])) . '</td>';
+            $inner .= '<td>' . formatStudentCampusCell($row['campus'] ?? null) . '</td>';
             $collegeCell = trim((string) ($row['college_name'] ?? ''));
             $programCell = trim((string) ($row['program_name'] ?? ''));
             $inner .= '<td>' . ($collegeCell !== '' ? htmlspecialchars($collegeCell) : '—') . '</td>';
@@ -4610,6 +5207,7 @@ function renderAdminRegisterStudentsPage(
     $acctPosted = (string) ($posted['student_account_type'] ?? '');
     $orgPosted = (string) ($posted['student_org_position'] ?? '');
     $stayingPosted = (string) ($posted['student_staying'] ?? '');
+    $campusPosted = (string) ($posted['campus'] ?? '');
     $collegePosted = (int) ($posted['college_id'] ?? 0);
     $programsJson = json_encode($programsByCollege, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE);
     if ($programsJson === false) {
@@ -4646,6 +5244,9 @@ function renderAdminRegisterStudentsPage(
             }
         }
         $inner .= '</select><div class="form-text">Programs update when you change college.</div></div>';
+        $eCampus = (string) ($editStudent['campus'] ?? '');
+        $inner .= '<div class="col-md-6"><label class="form-label">Campus</label>';
+        $inner .= renderStudentCampusSelect('campus', $eCampus, true) . '</div>';
         $eYl = (string) ($editStudent['year_level'] ?? '');
         $inner .= '<div class="col-md-6"><label class="form-label">Year level</label>';
         $inner .= renderYearLevelSelect('year_level', $eYl, true) . '</div>';
@@ -4665,7 +5266,7 @@ function renderAdminRegisterStudentsPage(
     }
 
     $inner .= '<div class="panel' . ($editStudent !== null ? ' mt-4' : '') . '"><div class="panel-header"><h3><i class="fas fa-user-plus"></i>Register Student</h3></div><div class="p-4">';
-    $inner .= '<p class="small text-muted mb-3">Create a student account linked to a college and program. The student signs in with the email and initial password you set here.</p>';
+    $inner .= '<p class="small text-muted mb-3">Create a student account linked to a campus, college, and program. The student signs in with the email and initial password you set here.</p>';
     $inner .= '<form method="POST" action="' . hpath('/admin/register-students') . '" class="row g-3" style="max-width:720px;" id="register-student-form">';
     $inner .= '<div class="col-md-6"><label class="form-label">Student number</label><input class="form-control" name="student_no" value="' . $sn . '" required></div>';
     $inner .= '<div class="col-md-6"><label class="form-label">Email (login)</label><input class="form-control" type="email" name="email" value="' . $em . '" required></div>';
@@ -4691,6 +5292,8 @@ function renderAdminRegisterStudentsPage(
         }
     }
     $inner .= '</select><div class="form-text">Programs update when you change college.</div></div>';
+    $inner .= '<div class="col-md-6"><label class="form-label">Campus</label>';
+    $inner .= renderStudentCampusSelect('campus', $campusPosted, true) . '</div>';
     $inner .= '<div class="col-md-6"><label class="form-label">Year level</label>';
     $inner .= renderYearLevelSelect('year_level', $ylPosted, true) . '</div>';
     $inner .= '<div class="col-md-6"><label class="form-label">Student account</label>';
@@ -4706,7 +5309,7 @@ function renderAdminRegisterStudentsPage(
 
     $inner .= '<div class="panel mt-4"><div class="panel-header"><h3><i class="fas fa-file-csv"></i>Bulk import (Excel → CSV)</h3></div><div class="p-4">';
     $inner .= '<p class="small mb-3"><a class="btn btn-sm btn-outline-secondary" href="' . hpath('/admin/download-students-csv-template') . '"><i class="fas fa-download me-1"></i>Download CSV template</a></p>';
-    $inner .= '<p class="small text-muted mb-3">Use one <strong>full_name</strong> column in Excel (e.g. <em>Maria Santos</em>). The last word becomes the last name; the rest is the first name. Optional <strong>student_account_type</strong>: <em>paying_tuition</em> or <em>not_paying_tuition</em> (defaults to paying if omitted). Optional <strong>student_org_position</strong>: <em>president</em>, <em>vice_president</em>, <em>treasurer</em>, <em>secretary</em>, <em>auditor</em>, or <em>na</em> (defaults to N/A if omitted). Optional <strong>student_staying</strong>: <em>wpu_dormitory</em>, <em>outside_dormitory</em>, or <em>commuter</em> (defaults to commuter if omitted).</p>';
+    $inner .= '<p class="small text-muted mb-3">Use one <strong>full_name</strong> column in Excel (e.g. <em>Maria Santos</em>). The last word becomes the last name; the rest is the first name. Required <strong>campus</strong>: <em>puerto_princesa</em>, <em>quezon</em>, <em>rio_tuba</em>, <em>el_nido</em>, <em>canique</em>, or <em>busuanga</em> (full campus names also accepted). Optional <strong>student_account_type</strong>: <em>paying_tuition</em> or <em>not_paying_tuition</em> (defaults to paying if omitted). Optional <strong>student_org_position</strong>: <em>president</em>, <em>vice_president</em>, <em>treasurer</em>, <em>secretary</em>, <em>auditor</em>, or <em>na</em> (defaults to N/A if omitted). Optional <strong>student_staying</strong>: <em>wpu_dormitory</em>, <em>outside_dormitory</em>, or <em>commuter</em> (defaults to commuter if omitted).</p>';
     $inner .= '<form method="POST" action="' . hpath('/admin/import-students-csv') . '" enctype="multipart/form-data" class="d-flex flex-wrap align-items-end gap-3">';
     $inner .= '<div><label class="form-label">CSV file</label><input class="form-control" type="file" name="csv" accept=".csv,text/csv" required></div>';
     $inner .= '<button class="btn btn-success" type="submit"><i class="fas fa-upload me-1"></i>Import CSV</button></form></div></div>';
@@ -4728,7 +5331,7 @@ function renderAdminRegisterStudentsPage(
         $inner .= '</div>';
         $inner .= '<div class="table-responsive"><table class="report-table mb-0"><thead><tr>';
         $inner .= '<th style="width:42px;"><input class="form-check-input" type="checkbox" id="select-all-students" title="Select all" aria-label="Select all students"></th>';
-        $inner .= '<th>Student No.</th><th>Name</th><th>Email</th><th>College</th><th>Program</th><th>Year</th><th>Account</th><th>Org Position</th><th>Staying</th><th>Clearance</th><th>Status</th><th style="width:200px;">Actions</th>';
+        $inner .= '<th>Student No.</th><th>Name</th><th>Email</th><th>Campus</th><th>College</th><th>Program</th><th>Year</th><th>Account</th><th>Org Position</th><th>Staying</th><th>Clearance</th><th>Status</th><th style="width:200px;">Actions</th>';
         $inner .= '</tr></thead><tbody>';
         foreach ($studentsAll as $st) {
             $sid = (int) $st['id'];
@@ -4743,6 +5346,7 @@ function renderAdminRegisterStudentsPage(
             $inner .= '<td>' . htmlspecialchars((string) ($st['student_no'] ?: '—')) . '</td>';
             $inner .= '<td>' . htmlspecialchars((string) ($st['last_name'] . ', ' . $st['first_name'])) . '</td>';
             $inner .= '<td>' . htmlspecialchars((string) $st['email']) . '</td>';
+            $inner .= '<td>' . formatStudentCampusCell($st['campus'] ?? null) . '</td>';
             $inner .= '<td>' . ($cname !== '' ? htmlspecialchars($cname) : '—') . '</td>';
             $inner .= '<td>' . ($pname !== '' ? htmlspecialchars($pname) : '—') . '</td>';
             $inner .= '<td>' . formatYearLevelCell($st['year_level'] ?? null) . '</td>';
@@ -4820,11 +5424,12 @@ function renderAdminControlPanel(string $activePath): string
         '/admin/signatories' => ['Add / Assign Signatory', 'fas fa-pen-signature'],
         '/admin/current-requirements' => ['Current Requirements', 'fas fa-tasks'],
         '/admin/final-clearance-tools' => ['Generate Final Clearance', 'fas fa-stamp'],
+        '/admin/pending-departments' => ['Pending Departments', 'fas fa-hourglass-half'],
         '/admin/reports' => ['Clearance Reports', 'fas fa-file-alt'],
         '/admin/settings' => ['Account Settings', 'fas fa-user-cog'],
     ];
 
-    $html = '<aside class="admin-sidebar"><div class="admin-sidebar-header"><h2>SAFE Clearance</h2><p>Office of Student Affairs</p></div><nav class="admin-nav">';
+    $html = '<aside class="admin-sidebar"><div class="admin-sidebar-header"><div class="admin-sidebar-brand"><img src="' . hasset('wpu-logo.png') . '" alt="Western Philippines University"><div><h2>SAFE Clearance</h2><p>Office of Student Affairs</p></div></div></div><nav class="admin-nav">';
     foreach ($items as $path => $item) {
         [$label, $icon] = $item;
         $activeClass = $activePath === $path ? 'active' : '';
@@ -5140,6 +5745,7 @@ function renderAdminSignatoriesPage(
             $inner .= '<td>' . (!empty($s['college_name']) ? htmlspecialchars((string) $s['college_name']) : '—') . '</td>';
             $inner .= '<td>' . ($active ? '<span class="status-pill status-cleared">Active</span>' : '<span class="status-pill status-pending">Inactive</span>') . '</td>';
             $inner .= '<td><div class="d-flex flex-wrap gap-1">';
+            $inner .= '<a class="btn btn-sm btn-outline-success" href="' . hpath('/admin/signatories') . '?edit_signatory_id=' . $sid . '">Edit</a>';
             if ($active) {
                 $inner .= '<form method="POST" action="' . hpath('/admin/signatory/deactivate') . '" class="d-inline" onsubmit="return confirm(\'Delete this signatory account? This will deactivate the account and unassign it from all offices.\');">';
                 $inner .= '<input type="hidden" name="user_id" value="' . $sid . '">';
@@ -5323,7 +5929,8 @@ table.clearance th { background: #efefef; }
   <table class="meta">
     <tr><td><strong>Student No:</strong> ' . htmlspecialchars((string) ($student['student_no'] ?? '-')) . '</td><td><strong>Semester:</strong> ' . htmlspecialchars($semester['term']) . '</td></tr>
     <tr><td><strong>Student Name:</strong> ' . htmlspecialchars($student['last_name'] . ', ' . $student['first_name']) . '</td><td><strong>Academic Year:</strong> ' . htmlspecialchars($semester['academic_year']) . '</td></tr>
-    <tr><td><strong>Year level:</strong> ' . (trim((string) ($student['year_level'] ?? '')) !== '' ? htmlspecialchars((string) $student['year_level']) : '—') . '</td><td><strong>Email:</strong> ' . htmlspecialchars($student['email']) . '</td></tr>
+    <tr><td><strong>Year level:</strong> ' . (trim((string) ($student['year_level'] ?? '')) !== '' ? htmlspecialchars((string) $student['year_level']) : '—') . '</td><td><strong>Campus:</strong> ' . formatStudentCampusCell($student['campus'] ?? null) . '</td></tr>
+    <tr><td><strong>Email:</strong> ' . htmlspecialchars($student['email']) . '</td><td></td></tr>
   </table>
   <table class="clearance">
     <thead>
@@ -5352,7 +5959,7 @@ function renderAdminReports(array $semester, array $rows, array $filters): strin
 
     $inner = '<div class="panel"><div class="panel-header"><h3><i class="fas fa-chart-line"></i>Admin Clearance Reports</h3></div><div class="p-4">';
     $inner .= '<form method="GET" action="' . hpath('/admin/reports') . '" class="row g-2">';
-    $inner .= '<div class="col-md-9"><label class="form-label">Overall Status</label><select class="form-select" name="overall_status">';
+    $inner .= '<div class="col-md-5"><label class="form-label">Overall Status</label><select class="form-select" name="overall_status">';
     $inner .= '<option value="">All</option>';
     foreach ($statusOptions as $status) {
         $selected = $selectedOverall === $status ? ' selected' : '';
@@ -5360,11 +5967,15 @@ function renderAdminReports(array $semester, array $rows, array $filters): strin
         $inner .= '<option value="' . $status . '"' . $selected . '>' . htmlspecialchars($label) . '</option>';
     }
     $inner .= '</select></div>';
+    $selectedCampus = trim((string) ($filters['campus'] ?? ''));
+    $inner .= '<div class="col-md-4"><label class="form-label">Campus</label>';
+    $inner .= renderStudentCampusSelect('campus', $selectedCampus, false, true) . '</div>';
     $inner .= '<div class="col-md-3 d-flex align-items-end"><button class="btn btn-success w-100">Apply Filters</button></div>';
     $inner .= '</form></div></div>';
 
     $query = http_build_query([
         'overall_status' => $selectedOverall,
+        'campus' => $selectedCampus,
         'export' => 'csv',
     ]);
     $inner .= '<div class="admin-toolbar">';
@@ -5375,9 +5986,9 @@ function renderAdminReports(array $semester, array $rows, array $filters): strin
     $inner .= '</div></div>';
 
     $inner .= '<div class="panel"><div style="overflow-x:auto;"><table class="report-table">';
-    $inner .= '<thead><tr><th>Student No</th><th>Name</th><th>College</th><th>Program</th><th>Year</th><th>Email</th><th>Overall Status</th></tr></thead><tbody>';
+    $inner .= '<thead><tr><th>Student No</th><th>Name</th><th>Campus</th><th>College</th><th>Program</th><th>Year</th><th>Email</th><th>Overall Status</th></tr></thead><tbody>';
     if ($rows === []) {
-        $inner .= '<tr><td colspan="7" class="text-center text-muted">No records found for current filters.</td></tr>';
+        $inner .= '<tr><td colspan="8" class="text-center text-muted">No records found for current filters.</td></tr>';
     } else {
         foreach ($rows as $row) {
             $name = $row['last_name'] . ', ' . $row['first_name'];
@@ -5386,6 +5997,7 @@ function renderAdminReports(array $semester, array $rows, array $filters): strin
             $inner .= '<tr>';
             $inner .= '<td>' . htmlspecialchars((string) ($row['student_no'] ?: 'N/A')) . '</td>';
             $inner .= '<td>' . htmlspecialchars($name) . '</td>';
+            $inner .= '<td>' . formatStudentCampusCell($row['campus'] ?? null) . '</td>';
             $inner .= '<td>' . ($collegeCell !== '' ? htmlspecialchars($collegeCell) : '—') . '</td>';
             $inner .= '<td>' . ($programCell !== '' ? htmlspecialchars($programCell) : '—') . '</td>';
             $inner .= '<td>' . formatYearLevelCell($row['year_level'] ?? null) . '</td>';
@@ -5416,16 +6028,273 @@ function downloadAdminReportCsv(array $rows, array $semester): void
         return;
     }
 
-    fputcsv($out, ['Student No', 'Name', 'College', 'Program', 'Year', 'Email', 'Overall Status']);
+    fputcsv($out, ['Student No', 'Name', 'Campus', 'College', 'Program', 'Year', 'Email', 'Overall Status']);
     foreach ($rows as $row) {
         fputcsv($out, [
             (string) ($row['student_no'] ?: 'N/A'),
             (string) ($row['last_name'] . ', ' . $row['first_name']),
+            ClearanceService::campusDisplayLabel((string) ($row['campus'] ?? '')),
             (string) ($row['college_name'] ?? ''),
             (string) ($row['program_name'] ?? ''),
             trim((string) ($row['year_level'] ?? '')),
             (string) $row['email'],
             ucwords(str_replace('_', ' ', (string) $row['overall_status'])),
+        ]);
+    }
+    fclose($out);
+}
+
+function officeStatusDisplayLabel(string $status): string
+{
+    return match (strtolower(trim($status))) {
+        'cleared' => 'Cleared',
+        'for_review' => 'For Review',
+        'rejected' => 'Disapproved',
+        default => 'Pending',
+    };
+}
+
+function pendingOfficeDisplayName(array $office): string
+{
+    $name = trim((string) ($office['office_name'] ?? ''));
+
+    return $name !== '' ? $name : 'Office';
+}
+
+/** @param array<string,mixed> $filters */
+function adminPendingMonitorQueryString(array $filters, array $overrides = []): string
+{
+    $merged = array_merge($filters, $overrides);
+    $q = [];
+    $officeId = (int) ($merged['office_id'] ?? 0);
+    if ($officeId > 0) {
+        $q['office_id'] = (string) $officeId;
+    }
+    $campus = trim((string) ($merged['campus'] ?? ''));
+    if ($campus !== '') {
+        $q['campus'] = $campus;
+    }
+    $collegeId = (int) ($merged['college_id'] ?? 0);
+    if ($collegeId > 0) {
+        $q['college_id'] = (string) $collegeId;
+    }
+    $programId = (int) ($merged['program_id'] ?? 0);
+    if ($programId > 0) {
+        $q['program_id'] = (string) $programId;
+    }
+    $yearLevel = trim((string) ($merged['year_level'] ?? ''));
+    if ($yearLevel !== '') {
+        $q['year_level'] = $yearLevel;
+    }
+    $searchName = trim((string) ($merged['search_name'] ?? ''));
+    if ($searchName !== '') {
+        $q['search_name'] = $searchName;
+    }
+    $officeStatus = strtolower(trim((string) ($merged['office_status'] ?? '')));
+    if (in_array($officeStatus, ['pending', 'for_review', 'rejected'], true)) {
+        $q['office_status'] = $officeStatus;
+    }
+
+    return $q === [] ? '' : '?' . http_build_query($q);
+}
+
+/**
+ * @param array{offices:list<array<string,mixed>>,students:list<array<string,mixed>>,stats:array<string,int>} $monitor
+ * @param array<string,mixed> $filters
+ * @param list<array<string,mixed>> $colleges
+ * @param array<int, list<array{id:int, code:string, name:string}>> $programsByCollege
+ */
+function renderAdminPendingDepartments(
+    array $semester,
+    array $monitor,
+    array $filters,
+    array $colleges,
+    array $programsByCollege
+): string {
+    $offices = $monitor['offices'] ?? [];
+    $students = $monitor['students'] ?? [];
+    $stats = $monitor['stats'] ?? [];
+    $selectedOfficeId = (int) ($filters['office_id'] ?? 0);
+    $selectedCampus = trim((string) ($filters['campus'] ?? ''));
+    $selectedCollege = (int) ($filters['college_id'] ?? 0);
+    $selectedProgram = (int) ($filters['program_id'] ?? 0);
+    $selectedYear = trim((string) ($filters['year_level'] ?? ''));
+    $searchName = trim((string) ($filters['search_name'] ?? ''));
+    $selectedStatus = strtolower(trim((string) ($filters['office_status'] ?? '')));
+
+    $selectedOfficeName = '';
+    foreach ($offices as $office) {
+        if ((int) ($office['office_id'] ?? 0) === $selectedOfficeId) {
+            $selectedOfficeName = pendingOfficeDisplayName($office);
+            break;
+        }
+    }
+
+    $inner = '<div class="panel"><div class="panel-header"><h3><i class="fas fa-hourglass-half"></i>Pending Departments</h3></div><div class="p-4">';
+    $inner .= '<p class="small text-muted mb-3">See which offices still need to clear each student. Click a department card to list only students pending in that office.</p>';
+    $inner .= '<form method="GET" action="' . hpath('/admin/pending-departments') . '" class="row g-2 align-items-end">';
+    $inner .= '<div class="col-md-3"><label class="form-label">Campus</label>';
+    $inner .= renderStudentCampusSelect('campus', $selectedCampus, false, true) . '</div>';
+    $inner .= '<div class="col-md-3"><label class="form-label">College</label><select class="form-select" name="college_id" id="monitor_filter_college_id">';
+    $inner .= '<option value="0"' . ($selectedCollege === 0 ? ' selected' : '') . '>All colleges</option>';
+    foreach ($colleges as $college) {
+        $cid = (int) ($college['id'] ?? 0);
+        $sel = $selectedCollege === $cid ? ' selected' : '';
+        $inner .= '<option value="' . $cid . '"' . $sel . '>' . htmlspecialchars((string) ($college['name'] ?? '')) . '</option>';
+    }
+    $inner .= '</select></div>';
+    $inner .= '<div class="col-md-3"><label class="form-label">Program</label><select class="form-select" name="program_id" id="monitor_filter_program_id">';
+    $inner .= '<option value="0"' . ($selectedProgram === 0 ? ' selected' : '') . '>All programs</option>';
+    if ($selectedCollege > 0 && isset($programsByCollege[$selectedCollege])) {
+        foreach ($programsByCollege[$selectedCollege] as $prog) {
+            $pid = (int) ($prog['id'] ?? 0);
+            $sel = $selectedProgram === $pid ? ' selected' : '';
+            $inner .= '<option value="' . $pid . '"' . $sel . '>' . htmlspecialchars((string) ($prog['name'] ?? '') . ' (' . (string) ($prog['code'] ?? '') . ')') . '</option>';
+        }
+    }
+    $inner .= '</select></div>';
+    $inner .= '<div class="col-md-3"><label class="form-label">Year level</label><select class="form-select" name="year_level">';
+    $yearOptions = ['' => 'All years', '1' => '1', '2' => '2', '3' => '3', '4' => '4', '5+' => '5+'];
+    foreach ($yearOptions as $val => $label) {
+        $valStr = (string) $val;
+        $sel = $selectedYear === $valStr ? ' selected' : '';
+        $inner .= '<option value="' . htmlspecialchars($valStr) . '"' . $sel . '>' . htmlspecialchars((string) $label) . '</option>';
+    }
+    $inner .= '</select></div>';
+    $inner .= '<div class="col-md-3"><label class="form-label">Department status</label><select class="form-select" name="office_status">';
+    $statusOptions = [
+        '' => 'All incomplete',
+        'pending' => 'Pending',
+        'for_review' => 'For Review',
+        'rejected' => 'Disapproved',
+    ];
+    foreach ($statusOptions as $val => $label) {
+        $sel = $selectedStatus === (string) $val ? ' selected' : '';
+        $inner .= '<option value="' . htmlspecialchars((string) $val) . '"' . $sel . '>' . htmlspecialchars($label) . '</option>';
+    }
+    $inner .= '</select></div>';
+    $inner .= '<div class="col-md-5"><label class="form-label">Search student</label>';
+    $inner .= '<input class="form-control" name="search_name" value="' . htmlspecialchars($searchName) . '" placeholder="Name or student number"></div>';
+    if ($selectedOfficeId > 0) {
+        $inner .= '<input type="hidden" name="office_id" value="' . $selectedOfficeId . '">';
+    }
+    $inner .= '<div class="col-md-4 d-flex gap-2"><button class="btn btn-success" type="submit">Apply filters</button>';
+    $inner .= '<a class="btn btn-outline-secondary" href="' . hpath('/admin/pending-departments') . '">Reset</a></div>';
+    $inner .= '</form></div></div>';
+
+    $inner .= '<div class="cards-grid">';
+    $inner .= '<div class="stat-card"><div class="stat-title"><i class="fas fa-users me-1"></i>Students in view</div><div class="stat-value">' . (int) ($stats['total_students'] ?? 0) . '</div></div>';
+    $inner .= '<div class="stat-card"><div class="stat-title"><i class="fas fa-hourglass-half me-1"></i>With pending departments</div><div class="stat-value">' . (int) ($stats['students_with_pending'] ?? 0) . '</div></div>';
+    $inner .= '<div class="stat-card"><div class="stat-title"><i class="fas fa-check-circle me-1"></i>Fully cleared</div><div class="stat-value">' . (int) ($stats['fully_cleared'] ?? 0) . '</div></div>';
+    $inner .= '</div>';
+
+    $inner .= '<div class="monitor-office-grid">';
+    $allQs = adminPendingMonitorQueryString($filters, ['office_id' => 0]);
+    $inner .= '<a class="monitor-office-card' . ($selectedOfficeId === 0 ? ' active' : '') . '" href="' . hpath('/admin/pending-departments') . $allQs . '">';
+    $inner .= '<div class="monitor-office-name">All departments</div>';
+    $inner .= '<div class="monitor-office-count">' . (int) ($stats['students_with_pending'] ?? 0) . '</div>';
+    $inner .= '<div class="monitor-office-meta">Students still incomplete</div></a>';
+    foreach ($offices as $office) {
+        $oid = (int) ($office['office_id'] ?? 0);
+        $incomplete = (int) ($office['incomplete'] ?? 0);
+        $active = $selectedOfficeId === $oid ? ' active' : '';
+        $cardQs = adminPendingMonitorQueryString($filters, ['office_id' => $oid]);
+        $inner .= '<a class="monitor-office-card' . $active . '" href="' . hpath('/admin/pending-departments') . $cardQs . '">';
+        $inner .= '<div class="monitor-office-name">' . htmlspecialchars(pendingOfficeDisplayName($office)) . '</div>';
+        $inner .= '<div class="monitor-office-count">' . $incomplete . '</div>';
+        $inner .= '<div class="monitor-office-meta">Pending ' . (int) ($office['pending'] ?? 0)
+            . ' · Review ' . (int) ($office['for_review'] ?? 0)
+            . ' · Disapproved ' . (int) ($office['rejected'] ?? 0)
+            . '</div></a>';
+    }
+    $inner .= '</div>';
+
+    $csvQs = adminPendingMonitorQueryString($filters);
+    $csvHref = hpath('/admin/pending-departments') . ($csvQs === '' ? '?export=csv' : $csvQs . '&export=csv');
+    $inner .= '<div class="admin-toolbar">';
+    $inner .= '<span class="text-muted">';
+    if ($selectedOfficeName !== '') {
+        $inner .= 'Showing students not yet cleared by <strong>' . htmlspecialchars($selectedOfficeName) . '</strong>. ';
+    }
+    $inner .= 'Results: ' . count($students) . '</span>';
+    $inner .= '<div class="d-flex gap-2">';
+    $inner .= '<a href="' . htmlspecialchars($csvHref) . '" class="btn btn-sm btn-outline-success">Export CSV</a>';
+    $inner .= '<a href="' . hpath('/dashboard') . '" class="btn btn-sm btn-outline-secondary">Back to Admin Dashboard</a>';
+    $inner .= '</div></div>';
+
+    $inner .= '<div class="panel"><div style="overflow-x:auto;"><table class="report-table">';
+    $inner .= '<thead><tr><th>Student No</th><th>Name</th><th>Campus</th><th>College</th><th>Program</th><th>Year</th><th>Pending departments</th></tr></thead><tbody>';
+    if ($students === []) {
+        $inner .= '<tr><td colspan="7" class="text-center text-muted">No students with pending departments for the current filters.</td></tr>';
+    } else {
+        foreach ($students as $row) {
+            $name = (string) ($row['last_name'] ?? '') . ', ' . (string) ($row['first_name'] ?? '');
+            $collegeCell = trim((string) ($row['college_name'] ?? ''));
+            $programCell = trim((string) ($row['program_name'] ?? ''));
+            $inner .= '<tr>';
+            $inner .= '<td>' . htmlspecialchars((string) (($row['student_no'] ?? '') !== '' ? $row['student_no'] : 'N/A')) . '</td>';
+            $inner .= '<td>' . htmlspecialchars($name) . '</td>';
+            $inner .= '<td>' . formatStudentCampusCell($row['campus'] ?? null) . '</td>';
+            $inner .= '<td>' . ($collegeCell !== '' ? htmlspecialchars($collegeCell) : '—') . '</td>';
+            $inner .= '<td>' . ($programCell !== '' ? htmlspecialchars($programCell) : '—') . '</td>';
+            $inner .= '<td>' . formatYearLevelCell($row['year_level'] ?? null) . '</td>';
+            $inner .= '<td>';
+            $pendingOffices = $row['pending_offices'] ?? [];
+            if (!is_array($pendingOffices) || $pendingOffices === []) {
+                $inner .= '<span class="text-muted">—</span>';
+            } else {
+                foreach ($pendingOffices as $pendingOffice) {
+                    $st = strtolower((string) ($pendingOffice['status'] ?? 'pending'));
+                    $chipClass = 'dept-chip dept-chip-' . (in_array($st, ['pending', 'for_review', 'rejected'], true) ? $st : 'pending');
+                    $label = pendingOfficeDisplayName($pendingOffice) . ' · ' . officeStatusDisplayLabel($st);
+                    $inner .= '<span class="' . $chipClass . '">' . htmlspecialchars($label) . '</span>';
+                }
+            }
+            $inner .= '</td></tr>';
+        }
+    }
+    $inner .= '</tbody></table></div></div>';
+
+    $programsJson = json_encode($programsByCollege, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE);
+    if ($programsJson === false) {
+        $programsJson = '{}';
+    }
+    $inner .= '<script>(function(){var byCollege=' . $programsJson . ';var c=document.getElementById("monitor_filter_college_id");var p=document.getElementById("monitor_filter_program_id");if(!c||!p)return;function refill(preserveSel){var id=parseInt(c.value,10)||0;var prev=preserveSel!==undefined?preserveSel:0;p.innerHTML="<option value=\\"0\\">All programs</option>";if(!byCollege[id])return;(byCollege[id]||[]).forEach(function(pr){var o=document.createElement("option");o.value=String(pr.id);o.textContent=pr.name+" ("+pr.code+")";if(prev&&parseInt(o.value,10)===prev)o.selected=true;p.appendChild(o);});}c.addEventListener("change",function(){refill(0);});})();</script>';
+
+    return renderAdminShell('/admin/pending-departments', $semester, $inner);
+}
+
+function downloadAdminPendingDepartmentsCsv(array $rows, array $semester): void
+{
+    $filename = sprintf(
+        'wpu-pending-departments-%s-%s.csv',
+        preg_replace('/[^a-zA-Z0-9]/', '-', (string) $semester['academic_year']),
+        strtolower((string) $semester['term'])
+    );
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+
+    $out = fopen('php://output', 'w');
+    if ($out === false) {
+        echo 'Could not open output stream.';
+        return;
+    }
+
+    fputcsv($out, ['Student No', 'Name', 'Campus', 'College', 'Program', 'Year', 'Pending Departments']);
+    foreach ($rows as $row) {
+        $pendingLabels = [];
+        foreach ($row['pending_offices'] ?? [] as $pendingOffice) {
+            $pendingLabels[] = pendingOfficeDisplayName($pendingOffice)
+                . ' (' . officeStatusDisplayLabel((string) ($pendingOffice['status'] ?? 'pending')) . ')';
+        }
+        fputcsv($out, [
+            (string) (($row['student_no'] ?? '') !== '' ? $row['student_no'] : 'N/A'),
+            (string) (($row['last_name'] ?? '') . ', ' . ($row['first_name'] ?? '')),
+            ClearanceService::campusDisplayLabel((string) ($row['campus'] ?? '')),
+            (string) ($row['college_name'] ?? ''),
+            (string) ($row['program_name'] ?? ''),
+            trim((string) ($row['year_level'] ?? '')),
+            implode('; ', $pendingLabels),
         ]);
     }
     fclose($out);

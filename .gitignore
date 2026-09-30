@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+composer.phar
+Thumbs.db
+.DS_Store
+*.log
+php_errors.log

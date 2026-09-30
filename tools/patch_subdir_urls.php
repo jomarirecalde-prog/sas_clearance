@@ -30,6 +30,7 @@ $paths = [
     '/admin/colleges-programs',
     '/admin/final-clearance',
     '/admin/reports',
+    '/admin/pending-departments',
     '/admin/college',
     '/admin/program/delete',
     '/admin/student/update',
