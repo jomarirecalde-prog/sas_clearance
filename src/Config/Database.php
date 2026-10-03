@@ -13,7 +13,7 @@ final class Database
     private const DEFAULT_PORT = 3306;
     private const DEFAULT_DBNAME = 'wpu_clearance';
     private const DEFAULT_USERNAME = 'root';
-    private const DEFAULT_PASSWORD = 'password';
+    private const DEFAULT_PASSWORD = '';
 
     public static function pdo(): PDO
     {
@@ -230,7 +230,7 @@ final class Database
         $checked = true;
 
         $stmt = $pdo->prepare(
-            'SELECT COUNT(*) FROM information_schema.COLUMNS
+            'SELECT COLUMN_TYPE FROM information_schema.COLUMNS
              WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :tbl AND COLUMN_NAME = :col'
         );
         $stmt->execute([
@@ -238,16 +238,22 @@ final class Database
             'tbl' => 'users',
             'col' => 'campus',
         ]);
-        if ((int) $stmt->fetchColumn() === 0) {
+        $columnType = $stmt->fetchColumn();
+        $campusEnum = "ENUM('puerto_princesa', 'quezon', 'rio_tuba', 'el_nido', 'canique', 'busuanga', 'aborlan')";
+        if ($columnType === false) {
             try {
                 $pdo->exec(
-                    "ALTER TABLE users ADD COLUMN campus ENUM('puerto_princesa', 'quezon', 'rio_tuba', 'el_nido', 'canique', 'busuanga') NULL AFTER program_id"
+                    "ALTER TABLE users ADD COLUMN campus {$campusEnum} NULL AFTER program_id"
                 );
             } catch (PDOException $e) {
                 if (!str_contains($e->getMessage(), 'Duplicate column name')) {
                     throw $e;
                 }
             }
+        } elseif (!str_contains(strtolower((string) $columnType), 'aborlan')) {
+            $pdo->exec(
+                "ALTER TABLE users MODIFY COLUMN campus {$campusEnum} NULL"
+            );
         }
 
         $demoCampuses = [

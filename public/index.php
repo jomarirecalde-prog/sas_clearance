@@ -142,6 +142,15 @@ if ($method === 'POST' && !AuthLayer::csrfIsValid()) {
         renderPage('Reset Password', renderResetPasswordForm(trim((string) ($_POST['token'] ?? '')), $csrfError, null));
         exit;
     }
+    if ($path === '/register') {
+        renderPage('Student Registration', renderStudentRegisterForm(
+            $csrfError,
+            studentRegisterPostedFields(),
+            $service->listActiveColleges(),
+            $service->programsGroupedByCollegeId()
+        ));
+        exit;
+    }
     if ($path === '/login' || !isset($_SESSION['user'])) {
         renderPage('Login', renderLoginForm($csrfError, buildLoginStats($service)));
         exit;
@@ -207,10 +216,13 @@ if ($path === '/app' && $method === 'POST') {
         renderPage('Student App', renderStudentAppLogin($blocked));
         exit;
     }
-    $user = $service->authenticate($email, $password);
-    if (!$user) {
-        $rateLimiter->recordLoginFailure($ip, $email);
-        renderPage('Student App', renderStudentAppLogin('Invalid credentials or inactive account.'));
+    $login = $service->attemptLogin($email, $password);
+    $user = is_array($login['user'] ?? null) ? $login['user'] : null;
+    if (!($login['ok'] ?? false) || $user === null) {
+        if ($login['count_failure'] ?? true) {
+            $rateLimiter->recordLoginFailure($ip, $email);
+        }
+        renderPage('Student App', renderStudentAppLogin((string) ($login['message'] ?? 'Invalid credentials or inactive account.')));
         exit;
     }
     if ((string) ($user['role'] ?? '') !== 'student') {
@@ -249,15 +261,66 @@ if ($path === '/login' && $method === 'POST') {
         renderPage('Login', renderLoginForm($blocked, buildLoginStats($service)));
         exit;
     }
-    $user = $service->authenticate($email, $password);
-    if (!$user) {
-        $rateLimiter->recordLoginFailure($ip, $email);
-        renderPage('Login', renderLoginForm('Invalid credentials or inactive account.', buildLoginStats($service)));
+    $login = $service->attemptLogin($email, $password);
+    $user = is_array($login['user'] ?? null) ? $login['user'] : null;
+    if (!($login['ok'] ?? false) || $user === null) {
+        if ($login['count_failure'] ?? true) {
+            $rateLimiter->recordLoginFailure($ip, $email);
+        }
+        renderPage('Login', renderLoginForm((string) ($login['message'] ?? 'Invalid credentials or inactive account.'), buildLoginStats($service)));
         exit;
     }
     $rateLimiter->clearLoginFailures($email);
     AuthLayer::login($user);
     header('Location: ' . app_path('/dashboard'));
+    exit;
+}
+
+if ($path === '/register' && ($method === 'GET' || $method === 'POST')) {
+    if (isset($_SESSION['user'])) {
+        header('Location: ' . app_path('/dashboard'));
+        exit;
+    }
+    $colleges = $service->listActiveColleges();
+    $programsByCollege = $service->programsGroupedByCollegeId();
+    if ($method === 'GET') {
+        renderPage('Student Registration', renderStudentRegisterForm(null, [], $colleges, $programsByCollege));
+        exit;
+    }
+    $ip = AuthLayer::clientIp();
+    $blocked = $rateLimiter->registerBlocked($ip);
+    $posted = studentRegisterPostedFields();
+    if ($blocked !== null) {
+        renderPage('Student Registration', renderStudentRegisterForm($blocked, $posted, $colleges, $programsByCollege));
+        exit;
+    }
+    $rateLimiter->recordRegistration($ip);
+    $password = (string) ($_POST['password'] ?? '');
+    $confirmPassword = (string) ($_POST['confirm_password'] ?? '');
+    if ($password !== $confirmPassword) {
+        renderPage('Student Registration', renderStudentRegisterForm('Password and confirm password do not match.', $posted, $colleges, $programsByCollege));
+        exit;
+    }
+    $result = $service->registerStudentWithCollegeProgram(
+        $posted['student_no'],
+        $posted['first_name'],
+        $posted['last_name'],
+        $posted['email'],
+        $password,
+        $posted['college_id'],
+        $posted['program_id'],
+        $posted['year_level'],
+        $posted['student_account_type'],
+        $posted['student_org_position'],
+        $posted['student_staying'],
+        $posted['campus'],
+        true
+    );
+    if ($result['ok'] ?? false) {
+        renderPage('Student Registration', renderStudentRegisterForm(null, [], $colleges, $programsByCollege, (string) $result['message']));
+        exit;
+    }
+    renderPage('Student Registration', renderStudentRegisterForm((string) ($result['message'] ?? 'Unable to submit registration.'), $posted, $colleges, $programsByCollege));
     exit;
 }
 
@@ -625,7 +688,13 @@ if ($path === '/dashboard' && $method === 'GET') {
     $requirements = $service->getAdminRequirements($semesterId);
     $students = $service->listStudentsWithOverallStatus($semesterId);
     $deadlineStatus = $service->getSemesterDeadlineStatus($semester);
-    renderPage('Admin Dashboard', renderAdminDashboard($semester, $requirements, $students, $deadlineStatus));
+    renderPage('Admin Dashboard', renderAdminDashboard(
+        $semester,
+        $requirements,
+        $students,
+        $deadlineStatus,
+        $service->countPendingStudentRegistrations()
+    ));
     exit;
 }
 
@@ -1260,8 +1329,15 @@ if ($path === '/admin/program/update' && $method === 'POST' && $user['role'] ===
     exit;
 }
 
+if ($path === '/admin/college/delete' && $method === 'POST' && $user['role'] === 'admin') {
+    $result = $service->deleteCollegeByAdmin((int) ($_POST['college_id'] ?? 0));
+    $_SESSION['flash'] = $result['message'];
+    header('Location: ' . app_path('/admin/colleges-programs'));
+    exit;
+}
+
 if ($path === '/admin/program/delete' && $method === 'POST' && $user['role'] === 'admin') {
-    $result = $service->setProgramActive((int) ($_POST['program_id'] ?? 0), false);
+    $result = $service->deleteProgramByAdmin((int) ($_POST['program_id'] ?? 0));
     $_SESSION['flash'] = $result['message'];
     header('Location: ' . app_path('/admin/colleges-programs'));
     exit;
@@ -1346,6 +1422,20 @@ if ($path === '/admin/student/deactivate' && $method === 'POST' && $user['role']
 
 if ($path === '/admin/student/reactivate' && $method === 'POST' && $user['role'] === 'admin') {
     $result = $service->setStudentActive((int) ($_POST['user_id'] ?? 0), true);
+    $_SESSION['flash'] = $result['message'];
+    header('Location: ' . app_path('/admin/register-students'));
+    exit;
+}
+
+if ($path === '/admin/student/approve' && $method === 'POST' && $user['role'] === 'admin') {
+    $result = $service->reviewStudentRegistration((int) ($_POST['user_id'] ?? 0), true);
+    $_SESSION['flash'] = $result['message'];
+    header('Location: ' . app_path('/admin/register-students'));
+    exit;
+}
+
+if ($path === '/admin/student/reject' && $method === 'POST' && $user['role'] === 'admin') {
+    $result = $service->reviewStudentRegistration((int) ($_POST['user_id'] ?? 0), false);
     $_SESSION['flash'] = $result['message'];
     header('Location: ' . app_path('/admin/register-students'));
     exit;
@@ -2079,6 +2169,7 @@ function renderStudentAppLogin(?string $error): string
         <div class="forgot-link"><a href="' . hpath('/forgot-password') . '?from=app">Forgot password?</a></div>
         <button type="submit" class="signin-btn"><i class="fas fa-arrow-right-to-bracket"></i> Sign in</button>
     </form>
+    <a class="sapp-staff-link" href="' . hpath('/register') . '?from=app">New student? Register for admin approval</a>
     ' . renderStudentAppInstallBanner() . '
     <a class="sapp-staff-link" href="' . hpath('/login') . '">Signatory or admin? Open the staff portal</a>
 </div>';
@@ -2129,7 +2220,8 @@ function renderPage(string $title, string $content): void
     $requestPath = $GLOBALS['_app_request_path'] ?? '/';
     $isStudentAppAuth = $requestPath === '/app' && !isset($_SESSION['user']);
     $isStudentAppGate = $requestPath === '/app';
-    $isAuthPage = in_array($requestPath, ['/login', '/forgot-password', '/reset-password'], true) && !isset($_SESSION['user']);
+    $isRegisterPage = $requestPath === '/register' && !isset($_SESSION['user']);
+    $isAuthPage = ($isRegisterPage || in_array($requestPath, ['/login', '/forgot-password', '/reset-password'], true)) && !isset($_SESSION['user']);
     $isStudentPopup = $requestPath === '/student/deadline-countdown';
     $isStudentView = isset($_SESSION['user']) && (string) ($_SESSION['user']['role'] ?? '') === 'student'
         && !$isStudentPopup;
@@ -2306,6 +2398,11 @@ function renderPage(string $title, string $content): void
         .auth-helper-actions{display:flex;gap:.6rem;flex-wrap:wrap;}
         .auth-helper-link{font-size:.82rem;color:#1f6390;text-decoration:none;font-weight:600;}
         .auth-helper-link:hover{text-decoration:underline;}
+        .auth-helper-shell.register-shell{max-width:760px;}
+        .auth-helper-card .form-select{border-radius:.9rem;padding:.78rem .92rem;border:1.5px solid #e2e8f0;}
+        .auth-helper-card .form-select:focus{border-color:#ff9f4a;box-shadow:0 0 0 4px rgba(255,159,74,.15);}
+        body.login-page.register-scroll{overflow:auto;align-items:flex-start;}
+        body.login-page.register-scroll .auth-helper-shell{margin:1.25rem auto 2rem;}
         .reset-debug{margin-top:.9rem;font-size:.78rem;background:#f8fafe;color:#2d4b63;padding:.65rem .8rem;border-radius:.8rem;word-break:break-all;}
         @keyframes fadeSlideUp{from{opacity:0;transform:translateY(12px);}to{opacity:1;transform:translateY(0);}}
         @media (max-width:991px){
@@ -2380,6 +2477,7 @@ function renderPage(string $title, string $content): void
     }
     $bodyClass = match (true) {
         $isStudentAppAuth || ($isStudentAppGate && !$isStudentView) => 'student-app-auth',
+        $isRegisterPage => 'login-page register-scroll',
         $isAuthPage => 'login-page',
         $isAdminView => 'admin-layout',
         $isStudentPopup => 'student-popup-page',
@@ -2913,6 +3011,7 @@ function renderLoginForm(?string $error, ?array $stats = null): string
                 <input type="password" id="password" name="password" class="input-field" placeholder="••••••••" required>
             </div>
             <div class="forgot-link"><a href="' . hpath('/forgot-password') . '">Forgot password?</a></div>
+            <div class="forgot-link" style="text-align:center;margin-top:0;"><a href="' . hpath('/register') . '">New student? Register with your Student ID</a></div>
             <button type="submit" class="signin-btn">
                 <i class="fas fa-arrow-right-to-bracket"></i> Sign in
             </button>
@@ -2996,6 +3095,101 @@ function renderLoginForm(?string $error, ?array $stats = null): string
     });
 })();
 </script>';
+}
+
+/**
+ * @return array{student_no:string, first_name:string, last_name:string, email:string, college_id:int, program_id:int, year_level:string, student_account_type:string, student_org_position:string, student_staying:string, campus:string}
+ */
+function studentRegisterPostedFields(): array
+{
+    return [
+        'student_no' => trim((string) ($_POST['student_no'] ?? '')),
+        'first_name' => postCapitalized('first_name'),
+        'last_name' => postCapitalized('last_name'),
+        'email' => trim((string) ($_POST['email'] ?? '')),
+        'college_id' => (int) ($_POST['college_id'] ?? 0),
+        'program_id' => (int) ($_POST['program_id'] ?? 0),
+        'year_level' => trim((string) ($_POST['year_level'] ?? '')),
+        'student_account_type' => trim((string) ($_POST['student_account_type'] ?? '')),
+        'student_org_position' => trim((string) ($_POST['student_org_position'] ?? '')),
+        'student_staying' => trim((string) ($_POST['student_staying'] ?? '')),
+        'campus' => trim((string) ($_POST['campus'] ?? '')),
+    ];
+}
+
+function renderStudentRegisterForm(
+    ?string $error,
+    array $posted,
+    array $colleges,
+    array $programsByCollege,
+    ?string $success = null
+): string {
+    $fromApp = ((string) ($_GET['from'] ?? $_POST['from'] ?? '')) === 'app';
+    $backPath = $fromApp ? '/app' : '/login';
+    $html = '<div class="auth-helper-shell register-shell"><div class="auth-helper-card">';
+    $html .= '<h2 class="auth-helper-title">Student registration</h2>';
+    $html .= '<p class="auth-helper-subtitle">Register with a valid Student ID (for example, 2025-0001). An administrator must approve it before you can sign in.</p>';
+    if ($success !== null && $success !== '') {
+        $html .= '<div class="alert alert-success py-2 px-3 small">' . htmlspecialchars($success) . '</div>';
+        $html .= '<div class="mt-3"><a class="auth-helper-link" href="' . hpath($backPath) . '"><i class="fas fa-arrow-left me-1"></i>Back to sign in</a></div>';
+        $html .= '</div></div>';
+
+        return $html;
+    }
+    if ($error) {
+        $html .= '<div class="error-message show"><i class="fas fa-exclamation-triangle"></i><span>' . htmlspecialchars($error) . '</span></div>';
+    }
+    $sn = htmlspecialchars((string) ($posted['student_no'] ?? ''));
+    $fn = htmlspecialchars((string) ($posted['first_name'] ?? ''));
+    $ln = htmlspecialchars((string) ($posted['last_name'] ?? ''));
+    $em = htmlspecialchars((string) ($posted['email'] ?? ''));
+    $collegePosted = (int) ($posted['college_id'] ?? 0);
+    $programPosted = (int) ($posted['program_id'] ?? 0);
+    $programsJson = json_encode($programsByCollege, JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_UNICODE);
+    if ($programsJson === false) {
+        $programsJson = '{}';
+    }
+    $html .= '<form method="POST" action="' . hpath('/register') . ($fromApp ? '?from=app' : '') . '" class="row g-3">';
+    $html .= csrf_field();
+    if ($fromApp) {
+        $html .= '<input type="hidden" name="from" value="app">';
+    }
+    $html .= '<div class="col-md-6"><label class="form-label">Student ID</label><input class="form-control" name="student_no" value="' . $sn . '" placeholder="2025-0001" required></div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Email</label><input class="form-control" type="email" name="email" value="' . $em . '" placeholder="name@wpu.edu.ph" required></div>';
+    $html .= '<div class="col-md-6"><label class="form-label">First name</label><input class="form-control" name="first_name" value="' . $fn . '" required></div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Last name</label><input class="form-control" name="last_name" value="' . $ln . '" required></div>';
+    $html .= '<div class="col-md-6"><label class="form-label">College</label><select class="form-select" name="college_id" id="self_register_college_id" required>';
+    $html .= '<option value="">Select college</option>';
+    foreach ($colleges as $college) {
+        $cid = (int) $college['id'];
+        $selected = $collegePosted === $cid ? ' selected' : '';
+        $html .= '<option value="' . $cid . '"' . $selected . '>' . htmlspecialchars((string) $college['name']) . '</option>';
+    }
+    $html .= '</select></div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Program</label><select class="form-select" name="program_id" id="self_register_program_id" required>';
+    $html .= '<option value="">Select program</option>';
+    if ($collegePosted > 0 && isset($programsByCollege[$collegePosted])) {
+        foreach ($programsByCollege[$collegePosted] as $prog) {
+            $pid = (int) $prog['id'];
+            $sel = $programPosted === $pid ? ' selected' : '';
+            $html .= '<option value="' . $pid . '"' . $sel . '>' . htmlspecialchars($prog['name'] . ' (' . $prog['code'] . ')') . '</option>';
+        }
+    }
+    $html .= '</select></div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Campus</label>' . renderStudentCampusSelect('campus', (string) ($posted['campus'] ?? ''), true) . '</div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Year level</label>' . renderYearLevelSelect('year_level', (string) ($posted['year_level'] ?? ''), true) . '</div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Student account</label>' . renderStudentAccountTypeSelect('student_account_type', (string) ($posted['student_account_type'] ?? ''), true) . '</div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Student org. position</label>' . renderStudentOrgPositionSelect('student_org_position', (string) ($posted['student_org_position'] ?? ''), true) . '</div>';
+    $html .= '<div class="col-12"><label class="form-label">Students staying</label>' . renderStudentStayingSelect('student_staying', (string) ($posted['student_staying'] ?? ''), true) . '</div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Password</label><input class="form-control" type="password" name="password" minlength="8" autocomplete="new-password" required><div class="form-text">At least 8 characters.</div></div>';
+    $html .= '<div class="col-md-6"><label class="form-label">Confirm password</label><input class="form-control" type="password" name="confirm_password" minlength="8" autocomplete="new-password" required></div>';
+    $html .= '<div class="col-12"><button type="submit" class="signin-btn" style="margin-top:0;"><i class="fas fa-user-plus"></i> Submit for approval</button></div>';
+    $html .= '</form>';
+    $html .= '<div class="mt-3"><a class="auth-helper-link" href="' . hpath($backPath) . '"><i class="fas fa-arrow-left me-1"></i>Back to sign in</a></div>';
+    $html .= '</div></div>';
+    $html .= '<script>(function(){var byCollege=' . $programsJson . ';var c=document.getElementById("self_register_college_id");var p=document.getElementById("self_register_program_id");if(!c||!p)return;c.addEventListener("change",function(){var id=parseInt(c.value,10)||0;var keep=p.value;p.innerHTML="<option value=\\"\\">Select program</option>";(byCollege[id]||[]).forEach(function(pr){var o=document.createElement("option");o.value=String(pr.id);o.textContent=pr.name+" ("+pr.code+")";if(String(pr.id)===keep)o.selected=true;p.appendChild(o);});});})();</script>';
+
+    return $html;
 }
 
 function renderForgotPasswordForm(
@@ -5005,7 +5199,7 @@ CSS;
     return $out;
 }
 
-function renderAdminDashboard(array $semester, array $requirements, array $students, array $deadlineStatus = []): string
+function renderAdminDashboard(array $semester, array $requirements, array $students, array $deadlineStatus = [], int $pendingRegistrations = 0): string
 {
     $totalStudents = count($students);
     $totalRequirements = count($requirements);
@@ -5021,6 +5215,11 @@ function renderAdminDashboard(array $semester, array $requirements, array $stude
     }
 
     $inner = renderClearanceDeadlineBanner($deadlineStatus);
+    if ($pendingRegistrations > 0) {
+        $inner .= '<div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-2">';
+        $inner .= '<span><i class="fas fa-user-clock me-1"></i><strong>' . $pendingRegistrations . '</strong> student registration' . ($pendingRegistrations === 1 ? '' : 's') . ' waiting for approval.</span>';
+        $inner .= '<a class="btn btn-sm btn-warning" href="' . hpath('/admin/register-students') . '">Review registrations</a></div>';
+    }
     if ($deadlineStatus['has_deadline'] ?? false) {
         $inner .= '<div class="panel mb-3"><div class="panel-header"><h3><i class="fas fa-calendar-check"></i>Completion Deadline</h3></div><div class="p-3">';
         $inner .= '<p class="mb-2"><strong>Due date:</strong> ' . htmlspecialchars((string) ($deadlineStatus['due_date_label'] ?? '')) . '</p>';
@@ -5038,7 +5237,10 @@ function renderAdminDashboard(array $semester, array $requirements, array $stude
     $inner .= '<div class="student-selector" style="margin-bottom:24px;">';
     $inner .= '<span style="display:block;font-size:.75rem;font-weight:600;text-transform:uppercase;color:#4b6b8f;margin-bottom:8px;letter-spacing:.3px;">Admin shortcuts</span>';
     $inner .= '<a class="btn btn-outline-secondary me-2 mb-2" href="' . hpath('/admin/signatories') . '"><i class="fas fa-pen-signature me-1"></i>Add / Assign Signatory</a>';
-    $inner .= '<a class="btn btn-outline-secondary me-2 mb-2" href="' . hpath('/admin/register-students') . '"><i class="fas fa-user-plus me-1"></i>Register Students</a>';
+    $registerLabel = $pendingRegistrations > 0
+        ? 'Register Students (' . $pendingRegistrations . ' pending)'
+        : 'Register Students';
+    $inner .= '<a class="btn btn-outline-secondary me-2 mb-2" href="' . hpath('/admin/register-students') . '"><i class="fas fa-user-plus me-1"></i>' . htmlspecialchars($registerLabel) . '</a>';
     $inner .= '<a class="btn btn-outline-secondary me-2 mb-2" href="' . hpath('/admin/pending-departments') . '"><i class="fas fa-hourglass-half me-1"></i>Pending Departments</a>';
     $inner .= '<a class="btn btn-outline-secondary mb-2" href="' . hpath('/admin/colleges-programs') . '"><i class="fas fa-school me-1"></i>Colleges &amp; Programs</a>';
     $inner .= '</div>';
@@ -5157,10 +5359,13 @@ function renderAdminCollegesProgramsPage(array $semester, array $colleges, array
     if ($colleges === []) {
         $inner .= '<div class="p-4 text-muted">No colleges yet.</div>';
     } else {
-        $inner .= '<div class="table-responsive"><table class="report-table mb-0"><thead><tr><th>Code</th><th>Name</th><th>Active</th></tr></thead><tbody>';
+        $inner .= '<div class="table-responsive"><table class="report-table mb-0"><thead><tr><th>Code</th><th>Name</th><th>Active</th><th>Actions</th></tr></thead><tbody>';
         foreach ($colleges as $c) {
             $inner .= '<tr><td>' . htmlspecialchars((string) $c['code']) . '</td><td>' . htmlspecialchars((string) $c['name']) . '</td>';
-            $inner .= '<td>' . (((int) ($c['is_active'] ?? 0) === 1) ? 'Yes' : 'No') . '</td></tr>';
+            $inner .= '<td>' . (((int) ($c['is_active'] ?? 0) === 1) ? 'Yes' : 'No') . '</td>';
+            $inner .= '<td><form method="POST" action="' . hpath('/admin/college/delete') . '" onsubmit="return confirm(\'Delete this college? Its programs, students, and their clearance records will also be deleted.\');">';
+            $inner .= '<input type="hidden" name="college_id" value="' . (int) $c['id'] . '">';
+            $inner .= '<button class="btn btn-sm btn-outline-danger" type="submit" title="Delete college"><i class="fas fa-trash-alt"></i></button></form></td></tr>';
         }
         $inner .= '</tbody></table></div>';
     }
@@ -5179,11 +5384,9 @@ function renderAdminCollegesProgramsPage(array $semester, array $colleges, array
             $inner .= '<td>' . ($isActive ? 'Yes' : 'No') . '</td>';
             $inner .= '<td><div class="d-flex gap-2">';
             $inner .= '<a class="btn btn-sm btn-outline-success" href="' . hpath('/admin/colleges-programs') . '?edit_program_id=' . (int) $p['id'] . '" title="Edit program"><i class="fas fa-pen"></i></a>';
-            if ($isActive) {
-                $inner .= '<form method="POST" action="' . hpath('/admin/program/delete') . '" onsubmit="return confirm(\'Delete this program?\');">';
-                $inner .= '<input type="hidden" name="program_id" value="' . (int) $p['id'] . '">';
-                $inner .= '<button class="btn btn-sm btn-outline-danger" type="submit" title="Delete program"><i class="fas fa-trash-alt"></i></button></form>';
-            }
+            $inner .= '<form method="POST" action="' . hpath('/admin/program/delete') . '" onsubmit="return confirm(\'Delete this program? Students in this program and their clearance records will also be deleted.\');">';
+            $inner .= '<input type="hidden" name="program_id" value="' . (int) $p['id'] . '">';
+            $inner .= '<button class="btn btn-sm btn-outline-danger" type="submit" title="Delete program"><i class="fas fa-trash-alt"></i></button></form>';
             $inner .= '</div></td></tr>';
         }
         $inner .= '</tbody></table></div>';
@@ -5191,6 +5394,37 @@ function renderAdminCollegesProgramsPage(array $semester, array $colleges, array
     $inner .= '</div></div>';
 
     return renderAdminShell('/admin/colleges-programs', $semester, $inner);
+}
+
+function renderStudentRegistrationDecisionButtons(int $studentId, string $registrationStatus, bool $active): string
+{
+    $html = '';
+    if ($registrationStatus === 'pending' || $registrationStatus === 'rejected') {
+        $html .= '<form method="POST" action="' . hpath('/admin/student/approve') . '" class="d-inline">';
+        $html .= '<input type="hidden" name="user_id" value="' . $studentId . '">';
+        $html .= '<button class="btn btn-sm btn-success" type="submit">Approve</button></form>';
+    }
+    if ($registrationStatus === 'pending') {
+        $html .= '<form method="POST" action="' . hpath('/admin/student/reject') . '" class="d-inline" onsubmit="return confirm(\'Reject this registration? The student will not be able to sign in.\');">';
+        $html .= '<input type="hidden" name="user_id" value="' . $studentId . '">';
+        $html .= '<button class="btn btn-sm btn-outline-danger" type="submit">Reject</button></form>';
+
+        return $html;
+    }
+    if ($registrationStatus === 'rejected') {
+        return $html;
+    }
+    if ($active) {
+        $html .= '<form method="POST" action="' . hpath('/admin/student/deactivate') . '" class="d-inline" onsubmit="return confirm(\'Deactivate this student? They cannot log in until reactivated.\');">';
+        $html .= '<input type="hidden" name="user_id" value="' . $studentId . '">';
+        $html .= '<button class="btn btn-sm btn-outline-danger" type="submit">Deactivate</button></form>';
+    } else {
+        $html .= '<form method="POST" action="' . hpath('/admin/student/reactivate') . '" class="d-inline">';
+        $html .= '<input type="hidden" name="user_id" value="' . $studentId . '">';
+        $html .= '<button class="btn btn-sm btn-outline-secondary" type="submit">Reactivate</button></form>';
+    }
+
+    return $html;
 }
 
 function renderAdminRegisterStudentsPage(
@@ -5267,8 +5501,39 @@ function renderAdminRegisterStudentsPage(
         $inner .= '<a class="btn btn-outline-secondary" href="' . hpath('/admin/register-students') . '">Cancel</a></div></form></div></div>';
     }
 
-    $inner .= '<div class="panel' . ($editStudent !== null ? ' mt-4' : '') . '"><div class="panel-header"><h3><i class="fas fa-user-plus"></i>Register Student</h3></div><div class="p-4">';
-    $inner .= '<p class="small text-muted mb-3">Create a student account linked to a campus, college, and program. The student signs in with the email and initial password you set here.</p>';
+    $pendingStudents = array_values(array_filter(
+        $studentsAll,
+        static fn (array $st): bool => (string) ($st['registration_status'] ?? '') === 'pending'
+    ));
+    $inner .= '<div class="panel' . ($editStudent !== null ? ' mt-4' : '') . '"><div class="panel-header"><h3><i class="fas fa-user-clock"></i>Pending student registrations</h3>';
+    $inner .= '<span class="badge-requirements">' . count($pendingStudents) . ' waiting</span></div><div class="p-0">';
+    if ($pendingStudents === []) {
+        $inner .= '<div class="p-4 text-muted">No self-registrations are waiting for approval.</div>';
+    } else {
+        $inner .= '<div class="table-responsive"><table class="report-table mb-0"><thead><tr>';
+        $inner .= '<th>Student ID</th><th>Name</th><th>Email</th><th>Campus</th><th>College</th><th>Program</th><th>Submitted</th><th style="width:220px;">Actions</th>';
+        $inner .= '</tr></thead><tbody>';
+        foreach ($pendingStudents as $st) {
+            $sid = (int) $st['id'];
+            $submitted = strtotime((string) ($st['created_at'] ?? ''));
+            $submittedLabel = $submitted !== false ? date('M j, Y g:i A', $submitted) : '—';
+            $inner .= '<tr>';
+            $inner .= '<td>' . htmlspecialchars((string) ($st['student_no'] ?: '—')) . '</td>';
+            $inner .= '<td>' . htmlspecialchars((string) ($st['last_name'] . ', ' . $st['first_name'])) . '</td>';
+            $inner .= '<td>' . htmlspecialchars((string) $st['email']) . '</td>';
+            $inner .= '<td>' . formatStudentCampusCell($st['campus'] ?? null) . '</td>';
+            $inner .= '<td>' . htmlspecialchars(trim((string) ($st['college_name'] ?? '')) !== '' ? (string) $st['college_name'] : '—') . '</td>';
+            $inner .= '<td>' . htmlspecialchars(trim((string) ($st['program_name'] ?? '')) !== '' ? (string) $st['program_name'] : '—') . '</td>';
+            $inner .= '<td>' . htmlspecialchars($submittedLabel) . '</td>';
+            $inner .= '<td>' . renderStudentRegistrationDecisionButtons($sid, 'pending', true) . '</td>';
+            $inner .= '</tr>';
+        }
+        $inner .= '</tbody></table></div>';
+    }
+    $inner .= '</div></div>';
+
+    $inner .= '<div class="panel mt-4"><div class="panel-header"><h3><i class="fas fa-user-plus"></i>Register Student</h3></div><div class="p-4">';
+    $inner .= '<p class="small text-muted mb-3">Create a student account that can sign in immediately, or review self-registrations above. Students who register themselves stay locked out until you approve a valid Student ID.</p>';
     $inner .= '<form method="POST" action="' . hpath('/admin/register-students') . '" class="row g-3" style="max-width:720px;" id="register-student-form">';
     $inner .= '<div class="col-md-6"><label class="form-label">Student number</label><input class="form-control" name="student_no" value="' . $sn . '" required></div>';
     $inner .= '<div class="col-md-6"><label class="form-label">Email (login)</label><input class="form-control" type="email" name="email" value="' . $em . '" required></div>';
@@ -5311,7 +5576,7 @@ function renderAdminRegisterStudentsPage(
 
     $inner .= '<div class="panel mt-4"><div class="panel-header"><h3><i class="fas fa-file-csv"></i>Bulk import (Excel → CSV)</h3></div><div class="p-4">';
     $inner .= '<p class="small mb-3"><a class="btn btn-sm btn-outline-secondary" href="' . hpath('/admin/download-students-csv-template') . '"><i class="fas fa-download me-1"></i>Download CSV template</a></p>';
-    $inner .= '<p class="small text-muted mb-3">Use one <strong>full_name</strong> column in Excel (e.g. <em>Maria Santos</em>). The last word becomes the last name; the rest is the first name. Required <strong>campus</strong>: <em>puerto_princesa</em>, <em>quezon</em>, <em>rio_tuba</em>, <em>el_nido</em>, <em>canique</em>, or <em>busuanga</em> (full campus names also accepted). Optional <strong>student_account_type</strong>: <em>paying_tuition</em> or <em>not_paying_tuition</em> (defaults to paying if omitted). Optional <strong>student_org_position</strong>: <em>president</em>, <em>vice_president</em>, <em>treasurer</em>, <em>secretary</em>, <em>auditor</em>, or <em>na</em> (defaults to N/A if omitted). Optional <strong>student_staying</strong>: <em>wpu_dormitory</em>, <em>outside_dormitory</em>, or <em>commuter</em> (defaults to commuter if omitted).</p>';
+    $inner .= '<p class="small text-muted mb-3">Use one <strong>full_name</strong> column in Excel (e.g. <em>Maria Santos</em>). The last word becomes the last name; the rest is the first name. Required <strong>campus</strong>: <em>puerto_princesa</em>, <em>quezon</em>, <em>rio_tuba</em>, <em>el_nido</em>, <em>canique</em>, <em>busuanga</em>, or <em>aborlan</em> (full campus names also accepted). Optional <strong>student_account_type</strong>: <em>paying_tuition</em> or <em>not_paying_tuition</em> (defaults to paying if omitted). Optional <strong>student_org_position</strong>: <em>president</em>, <em>vice_president</em>, <em>treasurer</em>, <em>secretary</em>, <em>auditor</em>, or <em>na</em> (defaults to N/A if omitted). Optional <strong>student_staying</strong>: <em>wpu_dormitory</em>, <em>outside_dormitory</em>, or <em>commuter</em> (defaults to commuter if omitted).</p>';
     $inner .= '<form method="POST" action="' . hpath('/admin/import-students-csv') . '" enctype="multipart/form-data" class="d-flex flex-wrap align-items-end gap-3">';
     $inner .= '<div><label class="form-label">CSV file</label><input class="form-control" type="file" name="csv" accept=".csv,text/csv" required></div>';
     $inner .= '<button class="btn btn-success" type="submit"><i class="fas fa-upload me-1"></i>Import CSV</button></form></div></div>';
@@ -5343,6 +5608,7 @@ function renderAdminRegisterStudentsPage(
             $ovRaw = (string) ($st['overall_status'] ?? 'pending');
             $ov = strtoupper($ovRaw);
             $ovClass = strtolower($ovRaw) === 'cleared' ? 'status-cleared' : 'status-pending';
+            $regStatus = (string) ($st['registration_status'] ?? 'approved');
             $inner .= '<tr>';
             $inner .= '<td><input class="form-check-input student-select-cb" type="checkbox" name="student_ids[]" value="' . $sid . '" aria-label="Select student"></td>';
             $inner .= '<td>' . htmlspecialchars((string) ($st['student_no'] ?: '—')) . '</td>';
@@ -5356,18 +5622,16 @@ function renderAdminRegisterStudentsPage(
             $inner .= '<td>' . formatStudentOrgPositionCell($st['student_org_position'] ?? null) . '</td>';
             $inner .= '<td>' . formatStudentStayingCell($st['student_staying'] ?? null) . '</td>';
             $inner .= '<td><span class="status-pill ' . $ovClass . '">' . htmlspecialchars($ov) . '</span></td>';
-            $inner .= '<td>' . ($active ? '<span class="status-pill status-cleared">Active</span>' : '<span class="status-pill status-pending">Inactive</span>') . '</td>';
+            if ($regStatus === 'pending') {
+                $inner .= '<td><span class="status-pill status-for-review">Pending approval</span></td>';
+            } elseif ($regStatus === 'rejected') {
+                $inner .= '<td><span class="status-pill status-rejected">Rejected</span></td>';
+            } else {
+                $inner .= '<td>' . ($active ? '<span class="status-pill status-cleared">Active</span>' : '<span class="status-pill status-pending">Inactive</span>') . '</td>';
+            }
             $inner .= '<td><div class="d-flex flex-wrap gap-1">';
             $inner .= '<a class="btn btn-sm btn-outline-success" href="' . hpath('/admin/register-students') . '?edit_student_id=' . $sid . '">Edit</a>';
-            if ($active) {
-                $inner .= '<form method="POST" action="' . hpath('/admin/student/deactivate') . '" class="d-inline" onsubmit="return confirm(\'Deactivate this student? They cannot log in until reactivated.\');">';
-                $inner .= '<input type="hidden" name="user_id" value="' . $sid . '">';
-                $inner .= '<button class="btn btn-sm btn-outline-danger" type="submit">Deactivate</button></form>';
-            } else {
-                $inner .= '<form method="POST" action="' . hpath('/admin/student/reactivate') . '" class="d-inline">';
-                $inner .= '<input type="hidden" name="user_id" value="' . $sid . '">';
-                $inner .= '<button class="btn btn-sm btn-outline-secondary" type="submit">Reactivate</button></form>';
-            }
+            $inner .= renderStudentRegistrationDecisionButtons($sid, $regStatus, $active);
             $inner .= '</div></td></tr>';
         }
         $inner .= '</tbody></table></div></form>';

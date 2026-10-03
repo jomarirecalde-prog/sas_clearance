@@ -6,7 +6,8 @@ ALTER TABLE users ADD COLUMN campus ENUM(
     'rio_tuba',
     'el_nido',
     'canique',
-    'busuanga'
+    'busuanga',
+    'aborlan'
 ) NULL AFTER program_id;
 
 -- Fill campus on seeded demo students (safe if already set).

@@ -29,36 +29,84 @@ final class ClearanceService
         $this->ensureStudentOfficeRequirementAttachmentColumns();
         $this->ensureSemesterDeadlineColumns();
         $this->ensureSemesterDeadlineNotificationLogTable();
+        $this->ensureStudentRegistrationStatusColumn();
         RateLimiter::ensureSchema($this->pdo);
     }
 
     public function authenticate(string $email, string $password): ?array
     {
+        $result = $this->attemptLogin($email, $password);
+
+        return ($result['ok'] ?? false) && is_array($result['user'] ?? null) ? $result['user'] : null;
+    }
+
+    /**
+     * Password is checked before any approval message, so a wrong password never reveals account status.
+     *
+     * @return array{ok:bool, user:?array, message:string, count_failure:bool}
+     */
+    public function attemptLogin(string $email, string $password): array
+    {
+        $invalid = [
+            'ok' => false,
+            'user' => null,
+            'message' => 'Invalid credentials or inactive account.',
+            'count_failure' => true,
+        ];
         $email = strtolower(trim($email));
         $stmt = $this->pdo->prepare("
-            SELECT id, first_name, last_name, email, role, password_hash, is_active
+            SELECT id, first_name, last_name, email, role, password_hash, is_active, registration_status
             FROM users
             WHERE email = :email
             LIMIT 1
         ");
         $stmt->execute(['email' => $email]);
         $user = $stmt->fetch();
-        if (!$user || (int) $user['is_active'] !== 1) {
+        if (!$user) {
             PasswordHasher::dummyVerify($password);
-            return null;
+
+            return $invalid;
         }
 
         $hash = (string) $user['password_hash'];
         if (!PasswordHasher::verify($password, $hash)) {
-            return null;
+            return $invalid;
         }
 
         if (PasswordHasher::needsRehash($hash)) {
             $this->upgradePasswordHash((int) $user['id'], $password);
         }
 
-        unset($user['password_hash']);
-        return $user;
+        $role = (string) ($user['role'] ?? '');
+        $registrationStatus = (string) ($user['registration_status'] ?? 'approved');
+        if ($role === 'student' && $registrationStatus === 'pending') {
+            return [
+                'ok' => false,
+                'user' => null,
+                'message' => 'Your registration is waiting for admin approval. You can sign in after your Student ID is approved.',
+                'count_failure' => false,
+            ];
+        }
+        if ($role === 'student' && $registrationStatus === 'rejected') {
+            return [
+                'ok' => false,
+                'user' => null,
+                'message' => 'Your registration was not approved. Contact the administrator if you need this reviewed again.',
+                'count_failure' => false,
+            ];
+        }
+        if ((int) ($user['is_active'] ?? 0) !== 1) {
+            return $invalid;
+        }
+
+        unset($user['password_hash'], $user['registration_status']);
+
+        return [
+            'ok' => true,
+            'user' => $user,
+            'message' => '',
+            'count_failure' => false,
+        ];
     }
 
     private function upgradePasswordHash(int $userId, string $password): void
@@ -2967,6 +3015,7 @@ final class ClearanceService
             'el_nido' => 'El Nido Campus',
             'canique' => 'Canique Extension School',
             'busuanga' => 'Busuanga Campus',
+            'aborlan' => 'Aborlan Main Campus',
         ];
     }
 
@@ -3006,12 +3055,16 @@ final class ClearanceService
             'canique_extension_school' => 'canique',
             'busuanga' => 'busuanga',
             'busuanga_campus' => 'busuanga',
+            'aborlan' => 'aborlan',
+            'aborlan_main' => 'aborlan',
+            'aborlan_main_campus' => 'aborlan',
+            'aborlan_campus' => 'aborlan',
         ];
         if (isset($map[$v])) {
             return ['ok' => true, 'message' => '', 'value' => $map[$v]];
         }
 
-        return ['ok' => false, 'message' => 'Campus must be Puerto Princesa City Campus, Quezon Campus, Rio Tuba Extension School, El Nido Campus, Canique Extension School, or Busuanga Campus.', 'value' => null];
+        return ['ok' => false, 'message' => 'Campus must be Puerto Princesa City Campus, Quezon Campus, Rio Tuba Extension School, El Nido Campus, Canique Extension School, Busuanga Campus, or Aborlan Main Campus.', 'value' => null];
     }
 
     public function registerStudentWithCollegeProgram(
@@ -3026,12 +3079,21 @@ final class ClearanceService
         string $studentAccountType,
         string $studentOrgPosition,
         string $studentStaying,
-        string $campus
+        string $campus,
+        bool $pendingAdminApproval = false
     ): array {
         $studentNo = trim($studentNo);
         $firstName = trim($firstName);
         $lastName = trim($lastName);
         $email = strtolower(trim($email));
+
+        if ($pendingAdminApproval) {
+            $idNorm = $this->normalizeStudentId($studentNo);
+            if (!$idNorm['ok']) {
+                return ['ok' => false, 'message' => $idNorm['message']];
+            }
+            $studentNo = (string) $idNorm['value'];
+        }
 
         if ($studentNo === '' || $firstName === '' || $lastName === '' || $email === '') {
             return ['ok' => false, 'message' => 'Student number, name fields, and email are required.'];
@@ -3098,9 +3160,9 @@ final class ClearanceService
         $hash = PasswordHasher::hash($password);
         $insert = $this->pdo->prepare("
             INSERT INTO users
-                (student_no, first_name, last_name, email, password_hash, role, college_id, program_id, campus, year_level, student_account_type, student_org_position, student_staying, is_active)
+                (student_no, first_name, last_name, email, password_hash, role, college_id, program_id, campus, year_level, student_account_type, student_org_position, student_staying, is_active, registration_status)
             VALUES
-                (:student_no, :first_name, :last_name, :email, :password_hash, 'student', :college_id, :program_id, :campus, :year_level, :student_account_type, :student_org_position, :student_staying, 1)
+                (:student_no, :first_name, :last_name, :email, :password_hash, 'student', :college_id, :program_id, :campus, :year_level, :student_account_type, :student_org_position, :student_staying, :is_active, :registration_status)
         ");
         $insert->execute([
             'student_no' => $studentNo,
@@ -3115,9 +3177,95 @@ final class ClearanceService
             'student_account_type' => $acctNorm['value'],
             'student_org_position' => $orgNorm['value'],
             'student_staying' => $stayingNorm['value'],
+            'is_active' => $pendingAdminApproval ? 0 : 1,
+            'registration_status' => $pendingAdminApproval ? 'pending' : 'approved',
         ]);
 
+        if ($pendingAdminApproval) {
+            return ['ok' => true, 'message' => 'Registration submitted. An administrator must approve your Student ID before you can sign in.'];
+        }
+
         return ['ok' => true, 'message' => 'Student registered successfully. They can sign in with the email and password you set.'];
+    }
+
+    /**
+     * @return array{ok:bool, message:string, value:?string}
+     */
+    public function normalizeStudentId(string $studentNo): array
+    {
+        $studentNo = trim($studentNo);
+        if (!preg_match('/^(20\d{2})-(\d{4})$/', $studentNo, $matches)) {
+            return [
+                'ok' => false,
+                'message' => 'Enter a valid Student ID such as 2025-0001 (year, a hyphen, then four digits).',
+                'value' => null,
+            ];
+        }
+        $year = (int) $matches[1];
+        $maxYear = (int) date('Y') + 1;
+        if ($year < 2000 || $year > $maxYear) {
+            return [
+                'ok' => false,
+                'message' => 'That Student ID year is not valid.',
+                'value' => null,
+            ];
+        }
+
+        return ['ok' => true, 'message' => '', 'value' => $studentNo];
+    }
+
+    public function countPendingStudentRegistrations(): int
+    {
+        return (int) $this->pdo->query("
+            SELECT COUNT(*)
+            FROM users
+            WHERE role = 'student' AND registration_status = 'pending'
+        ")->fetchColumn();
+    }
+
+    public function reviewStudentRegistration(int $studentId, bool $approve): array
+    {
+        if ($studentId <= 0) {
+            return ['ok' => false, 'message' => 'Invalid student.'];
+        }
+        $stmt = $this->pdo->prepare("
+            SELECT registration_status
+            FROM users
+            WHERE id = :id AND role = 'student'
+            LIMIT 1
+        ");
+        $stmt->execute(['id' => $studentId]);
+        $status = $stmt->fetchColumn();
+        if ($status === false) {
+            return ['ok' => false, 'message' => 'Student not found.'];
+        }
+        $status = (string) $status;
+        if ($approve) {
+            if ($status === 'approved') {
+                return ['ok' => false, 'message' => 'This student is already approved.'];
+            }
+            $update = $this->pdo->prepare("
+                UPDATE users
+                SET registration_status = 'approved', is_active = 1
+                WHERE id = :id AND role = 'student'
+                LIMIT 1
+            ");
+            $update->execute(['id' => $studentId]);
+
+            return ['ok' => true, 'message' => 'Registration approved. The student can now sign in.'];
+        }
+        if ($status !== 'pending') {
+            return ['ok' => false, 'message' => 'Only a pending registration can be rejected.'];
+        }
+        $update = $this->pdo->prepare("
+            UPDATE users
+            SET registration_status = 'rejected', is_active = 0
+            WHERE id = :id AND role = 'student' AND registration_status = 'pending'
+            LIMIT 1
+        ");
+        $update->execute(['id' => $studentId]);
+
+        return ['ok' => true, 'message' => 'Registration rejected. The student cannot sign in.'];
     }
 
     public function registerStudentWithCollegeProgramByCodes(
@@ -3186,6 +3334,8 @@ final class ClearanceService
                 u.last_name,
                 u.email,
                 u.is_active,
+                u.registration_status,
+                u.created_at,
                 u.college_id,
                 u.program_id,
                 u.year_level,
@@ -3202,7 +3352,15 @@ final class ClearanceService
             LEFT JOIN student_semester_clearances ssc
                 ON ssc.student_id = u.id AND ssc.semester_id = :semester_id
             WHERE u.role = 'student'
-            ORDER BY u.is_active DESC, u.last_name, u.first_name
+            ORDER BY
+                CASE u.registration_status
+                    WHEN 'pending' THEN 0
+                    WHEN 'rejected' THEN 1
+                    ELSE 2
+                END,
+                u.is_active DESC,
+                u.last_name,
+                u.first_name
         ");
         $stmt->execute(['semester_id' => $semesterId]);
 
@@ -3380,10 +3538,24 @@ final class ClearanceService
         if ($id <= 0) {
             return ['ok' => false, 'message' => 'Invalid student.'];
         }
+        if ($active) {
+            $stmt = $this->pdo->prepare("
+                UPDATE users
+                SET is_active = 1
+                WHERE id = :id AND role = 'student' AND registration_status = 'approved'
+                LIMIT 1
+            ");
+            $stmt->execute(['id' => $id]);
+            if ($stmt->rowCount() === 0) {
+                return ['ok' => false, 'message' => 'Only an approved student can be reactivated. Use Approve for a pending registration.'];
+            }
+
+            return ['ok' => true, 'message' => 'Student reactivated.'];
+        }
         $stmt = $this->pdo->prepare("
-            UPDATE users SET is_active = :active WHERE id = :id AND role = 'student' LIMIT 1
+            UPDATE users SET is_active = 0 WHERE id = :id AND role = 'student' LIMIT 1
         ");
-        $stmt->execute(['active' => $active ? 1 : 0, 'id' => $id]);
+        $stmt->execute(['id' => $id]);
         if ($stmt->rowCount() === 0) {
             return ['ok' => false, 'message' => 'Student not found.'];
         }
@@ -3709,6 +3881,130 @@ final class ClearanceService
         }
 
         return ['ok' => true, 'message' => $active ? 'Program reactivated.' : 'Program deleted.'];
+    }
+
+    public function deleteProgramByAdmin(int $programId): array
+    {
+        if ($programId <= 0) {
+            return ['ok' => false, 'message' => 'Invalid program.'];
+        }
+        $exists = $this->pdo->prepare('SELECT 1 FROM programs WHERE id = :id LIMIT 1');
+        $exists->execute(['id' => $programId]);
+        if (!$exists->fetchColumn()) {
+            return ['ok' => false, 'message' => 'Program not found.'];
+        }
+
+        try {
+            $this->pdo->beginTransaction();
+            $studentCount = $this->purgeStudentsMatching('program_id = :program_id', ['program_id' => $programId]);
+            $this->pdo->prepare('UPDATE users SET program_id = NULL WHERE program_id = :id')
+                ->execute(['id' => $programId]);
+            $this->pdo->prepare('DELETE FROM programs WHERE id = :id LIMIT 1')
+                ->execute(['id' => $programId]);
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+
+            return ['ok' => false, 'message' => 'Could not delete this program. Please try again.'];
+        }
+
+        $message = 'Program deleted.';
+        if ($studentCount > 0) {
+            $message .= ' ' . $studentCount . ' student account' . ($studentCount === 1 ? '' : 's')
+                . ' and related clearance data were also removed.';
+        }
+
+        return ['ok' => true, 'message' => $message];
+    }
+
+    public function deleteCollegeByAdmin(int $collegeId): array
+    {
+        if ($collegeId <= 0) {
+            return ['ok' => false, 'message' => 'Invalid college.'];
+        }
+        $exists = $this->pdo->prepare('SELECT 1 FROM colleges WHERE id = :id LIMIT 1');
+        $exists->execute(['id' => $collegeId]);
+        if (!$exists->fetchColumn()) {
+            return ['ok' => false, 'message' => 'College not found.'];
+        }
+
+        try {
+            $this->pdo->beginTransaction();
+            $programIds = $this->pdo->prepare('SELECT id FROM programs WHERE college_id = :id');
+            $programIds->execute(['id' => $collegeId]);
+            $ids = array_map(static fn ($id): int => (int) $id, $programIds->fetchAll(\PDO::FETCH_COLUMN));
+
+            $where = 'college_id = :college_id';
+            $bind = ['college_id' => $collegeId];
+            if ($ids !== []) {
+                $placeholders = [];
+                foreach ($ids as $index => $programId) {
+                    $key = 'pid' . $index;
+                    $placeholders[] = ':' . $key;
+                    $bind[$key] = $programId;
+                }
+                $where .= ' OR program_id IN (' . implode(',', $placeholders) . ')';
+            }
+            $studentCount = $this->purgeStudentsMatching($where, $bind);
+
+            $this->pdo->prepare('UPDATE users SET college_id = NULL WHERE college_id = :id')
+                ->execute(['id' => $collegeId]);
+            if ($ids !== []) {
+                $placeholders = implode(',', array_fill(0, count($ids), '?'));
+                $this->pdo->prepare("UPDATE users SET program_id = NULL WHERE program_id IN ($placeholders)")
+                    ->execute($ids);
+                $this->pdo->prepare('DELETE FROM programs WHERE college_id = :id')
+                    ->execute(['id' => $collegeId]);
+            }
+            $this->pdo->prepare('DELETE FROM colleges WHERE id = :id LIMIT 1')
+                ->execute(['id' => $collegeId]);
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+
+            return ['ok' => false, 'message' => 'Could not delete this college. Please try again.'];
+        }
+
+        $programCount = count($ids ?? []);
+        $message = 'College deleted.';
+        $parts = [];
+        if ($programCount > 0) {
+            $parts[] = $programCount . ' program' . ($programCount === 1 ? '' : 's');
+        }
+        if ($studentCount > 0) {
+            $parts[] = $studentCount . ' student account' . ($studentCount === 1 ? '' : 's') . ' and related clearance data';
+        }
+        if ($parts !== []) {
+            $message .= ' Also removed: ' . implode(' and ', $parts) . '.';
+        }
+
+        return ['ok' => true, 'message' => $message];
+    }
+
+    /**
+     * @param array<string, int> $bind
+     */
+    private function purgeStudentsMatching(string $whereSql, array $bind): int
+    {
+        $stmt = $this->pdo->prepare("
+            SELECT id
+            FROM users
+            WHERE role = 'student'
+              AND ($whereSql)
+        ");
+        $stmt->execute($bind);
+        $deleted = 0;
+        foreach ($stmt->fetchAll(\PDO::FETCH_COLUMN) as $id) {
+            if ($this->purgeStudentAccount((int) $id)) {
+                $deleted++;
+            }
+        }
+
+        return $deleted;
     }
 
     public function listOffices(): array
@@ -5498,6 +5794,23 @@ final class ClearanceService
         if (is_file($absolute)) {
             @unlink($absolute);
         }
+    }
+
+    private function ensureStudentRegistrationStatusColumn(): void
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT COUNT(*) FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tbl AND COLUMN_NAME = :col'
+        );
+        $stmt->execute(['tbl' => 'users', 'col' => 'registration_status']);
+        if ((int) $stmt->fetchColumn() > 0) {
+            return;
+        }
+        $this->pdo->exec("
+            ALTER TABLE users
+            ADD COLUMN registration_status ENUM('approved', 'pending', 'rejected') NOT NULL DEFAULT 'approved'
+            AFTER is_active
+        ");
     }
 
     private function ensureUserProfilePhotoColumn(): void

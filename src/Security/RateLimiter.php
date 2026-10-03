@@ -23,6 +23,10 @@ final class RateLimiter
     private const RESET_WINDOW = 900;
     private const RESET_LOCK = 900;
 
+    private const REGISTER_IP_MAX = 8;
+    private const REGISTER_WINDOW = 1800;
+    private const REGISTER_LOCK = 1800;
+
     public function __construct(private readonly PDO $pdo)
     {
         self::ensureSchema($this->pdo);
@@ -94,6 +98,18 @@ final class RateLimiter
     public function recordResetPasswordFailure(string $ip): void
     {
         $this->hit('reset_ip', $ip, self::RESET_IP_MAX, self::RESET_WINDOW, self::RESET_LOCK);
+    }
+
+    public function registerBlocked(string $ip): ?string
+    {
+        return $this->blockedMessage([
+            $this->inspect('register_ip', $ip, self::REGISTER_IP_MAX, self::REGISTER_WINDOW),
+        ], 'registration');
+    }
+
+    public function recordRegistration(string $ip): void
+    {
+        $this->hit('register_ip', $ip, self::REGISTER_IP_MAX, self::REGISTER_WINDOW, self::REGISTER_LOCK);
     }
 
     /**
